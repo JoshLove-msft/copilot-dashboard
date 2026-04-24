@@ -75,7 +75,14 @@ script directly:
 
 ## Update
 
-Re-run the install one-liner above — it overwrites the files in place.
+Just run `cdash` again — the launcher pulls the latest `dashboard.py`,
+`copilot-dash.ps1`, and `requirements.txt` from GitHub on every launch
+(best effort, ~1s; silently skipped if you're offline). If
+`requirements.txt` changed, dependencies get re-installed automatically.
+
+To pin a version and skip the auto-update, run with `-NoUpdate` or set
+`$env:COPILOT_DASH_NO_UPDATE = '1'`. To force a clean reinstall from
+scratch, re-run the install one-liner.
 
 ## Keys
 
