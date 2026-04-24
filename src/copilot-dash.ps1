@@ -19,7 +19,7 @@ $skip = $NoUpdate -or ($env:COPILOT_DASH_NO_UPDATE -eq '1')
 if (-not $skip) {
     $base       = 'https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main'
     $srcBase    = "$base/src"
-    $files      = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt')
+    $files      = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt', '_new-session-launcher.ps1')
     $reqBefore  = if (Test-Path (Join-Path $root 'requirements.txt')) {
         Get-FileHash (Join-Path $root 'requirements.txt') -Algorithm SHA256
     } else { $null }

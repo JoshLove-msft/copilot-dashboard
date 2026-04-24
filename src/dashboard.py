@@ -723,7 +723,16 @@ def launch_new_session(cwd: str | None = None, cfg: dict | None = None) -> tuple
     cwd = cwd or os.getcwd()
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
-    inner = [shell, "-NoExit", "-Command", copilot_command(cfg)]
+    cmd = copilot_command(cfg)
+    helper = Path(__file__).resolve().parent / "_new-session-launcher.ps1"
+    if helper.exists():
+        # Use the helper so the WT tab title auto-updates to the session
+        # summary as soon as `copilot` creates one. Falls back to plain
+        # invocation if the helper is missing for any reason.
+        inner = [shell, "-NoExit", "-NoProfile", "-File", str(helper),
+                 "-CopilotCommand", cmd]
+    else:
+        inner = [shell, "-NoExit", "-Command", cmd]
     title = "copilot:new"
     wt = _resolve_wt()
     if wt:

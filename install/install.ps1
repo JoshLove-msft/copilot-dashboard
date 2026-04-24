@@ -22,7 +22,7 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 
 $base    = "https://raw.githubusercontent.com/$Owner/$RepoName/$Branch"
 $srcBase = "$base/src"
-$files   = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt')
+$files   = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt', '_new-session-launcher.ps1')
 $rootFiles = @('README.md', 'LICENSE')
 
 Write-Host "Installing Copilot Dashboard..." -ForegroundColor Cyan
