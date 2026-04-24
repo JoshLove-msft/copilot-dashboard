@@ -679,7 +679,7 @@ def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
     cwd = cwd or os.getcwd()
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
-    inner = [shell, "-NoExit", "-Command", "copilot"]
+    inner = [shell, "-NoExit", "-Command", "copilot --yolo --autopilot"]
     title = "copilot:new"
     wt = _resolve_wt()
     if wt:
@@ -721,7 +721,7 @@ def launch_session_tab(session: "Session") -> tuple[bool, str]:
     """
     shell = _resolve_shell()
     cwd = session.cwd or os.path.expanduser("~")
-    resume_cmd = f'copilot --resume="{session.id}"'
+    resume_cmd = f'copilot --yolo --autopilot --resume="{session.id}"'
     inner = [shell, "-NoExit", "-Command", resume_cmd]
     # Prefer the session summary as the tab title; fall back to the short id.
     summary = (session.summary or "").strip()
