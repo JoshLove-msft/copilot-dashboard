@@ -1255,8 +1255,24 @@ class DashboardApp(App):
                     cwd = sess.cwd
         except Exception:
             pass
-        ok, msg = launch_new_session(cwd, cfg=self.config)
-        self.query_one("#status", Static).update(msg if ok else f"[red]{msg}[/red]")
+        where = cwd or os.path.expanduser("~")
+        self.query_one("#status", Static).update(
+            f"[yellow]⏳ launching new copilot session in {where}…[/yellow]"
+        )
+        self._run_launch(lambda: launch_new_session(cwd, cfg=self.config))
+
+    def _run_launch(self, fn) -> None:
+        """Run a blocking launch/focus call in a worker so the UI stays responsive."""
+        def _worker() -> None:
+            try:
+                ok, msg = fn()
+            except Exception as exc:  # pragma: no cover - defensive
+                ok, msg = False, f"launch error: {exc}"
+            text = msg if ok else f"[red]{msg}[/red]"
+            self.call_from_thread(
+                lambda: self.query_one("#status", Static).update(text)
+            )
+        self.run_worker(_worker, thread=True, exclusive=False)
 
     def _selected_session(self) -> Session | None:
         try:
@@ -1364,16 +1380,22 @@ class DashboardApp(App):
         if sess is None:
             return
         status = self.query_one("#status", Static)
-        # Refresh live status for this jump so a tab opened seconds ago is found.
-        detect_live_sessions([sess])
-        # Always try focus first — a tab might exist even if process detection missed it.
-        ok, msg = focus_session(sess)
-        if ok:
-            status.update(msg)
-            return
-        # No existing tab (or focus failed) — launch a fresh one.
-        ok, msg = launch_session_tab(sess, cfg=self.config)
-        status.update(msg if ok else f"[red]{msg}[/red]")
+        label = (sess.summary or sess.short_id).strip() or sess.short_id
+        if sess.is_live:
+            status.update(f"[yellow]⏳ focusing tab for {label}…[/yellow]")
+        else:
+            status.update(f"[yellow]⏳ launching {label}…[/yellow]")
+
+        def _do_jump() -> tuple[bool, str]:
+            # Refresh live status so a tab opened seconds ago is found.
+            detect_live_sessions([sess])
+            ok, msg = focus_session(sess)
+            if ok:
+                return ok, msg
+            # No existing tab (or focus failed) — launch a fresh one.
+            return launch_session_tab(sess, cfg=self.config)
+
+        self._run_launch(_do_jump)
 
     PR_COL = 4  # index of the PR column in the table
 
