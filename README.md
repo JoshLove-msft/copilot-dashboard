@@ -48,25 +48,30 @@ One line in PowerShell (Windows):
 iwr -useb https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main/install/install.ps1 | iex
 ```
 
-That downloads the dashboard into `%USERPROFILE%\.copilot-dashboard` and
+That downloads the dashboard into `%USERPROFILE%\.copilot-dashboard`,
 installs the Python dependencies (`textual`, `pyyaml`, `psutil`,
-`uiautomation`) into your current Python environment. Requires Python 3.10+.
+`uiautomation`) into your current Python environment, and adds a `cdash`
+launcher to your user `PATH`. Requires Python 3.10+.
 
 ## Run
+
+In any new shell (or the Win+R Run dialog):
+
+```
+cdash
+```
+
+That's it — no profile editing required. The installer drops a
+`cdash.cmd` / `cdash.ps1` shim into `%USERPROFILE%\.copilot-dashboard\bin`
+and adds that directory to your user `PATH`. Open a fresh terminal after
+installing so the updated `PATH` takes effect.
+
+If `cdash` isn't found (some shells cache `PATH`), you can always run the
+script directly:
 
 ```powershell
 & "$env:USERPROFILE\.copilot-dashboard\copilot-dash.ps1"
 ```
-
-### Optional alias
-
-Add to your PowerShell `$PROFILE`:
-
-```powershell
-function cdash { & "$env:USERPROFILE\.copilot-dashboard\copilot-dash.ps1" @args }
-```
-
-Then just run `cdash` from anywhere.
 
 ## Update
 
