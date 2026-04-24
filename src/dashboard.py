@@ -756,6 +756,7 @@ class DashboardApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("a", "toggle_empty", "Show empty"),
         Binding("l", "toggle_live", "Live only"),
+        Binding("g", "toggle_group", "Group by repo"),
         Binding("v", "open_in_vscode", "Open in VSCode"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False),
@@ -768,6 +769,7 @@ class DashboardApp(App):
         self.filter_text: str = ""
         self.show_empty: bool = False  # hide sessions with no summary by default
         self.live_only: bool = False   # when True, hide non-live sessions
+        self.group_by_repo: bool = False  # when True, group rows by repository
         self.sort_col: int | None = None  # None → default tier sort
         self.sort_desc: bool = False
 
@@ -855,14 +857,23 @@ class DashboardApp(App):
         # If user picked a sort column, use it; otherwise default tiered sort.
         if self.sort_col is not None and self.sort_col in self._sort_keys:
             _, keyfn, _ = self._sort_keys[self.sort_col]
+            sec_key, sec_desc = keyfn, self.sort_desc
             ordered = sorted(self.sessions, key=keyfn, reverse=self.sort_desc)
         else:
             def _sort_key(s: Session):
                 tier = 0 if s.is_live else (1 if s.is_recent else 2)
                 ts = s.updated_at or datetime.fromtimestamp(s.mtime, tz=timezone.utc)
                 return (tier, -ts.timestamp())
+            sec_key, sec_desc = _sort_key, False
             ordered = sorted(self.sessions, key=_sort_key)
+        # If grouping by repo, re-sort: primary = repo (empty last),
+        # secondary = whatever sort was already applied (stable sort).
+        if self.group_by_repo:
+            ordered = sorted(ordered, key=lambda s: ((s.repository or "") == "",
+                                                     (s.repository or "").lower()))
         # Live and recent counts always reflect the actual sessions, not order.
+        # Pre-filter so we know the visible set (needed for group separators).
+        visible: list[Session] = []
         for s in ordered:
             if s.is_live:
                 live_count += 1
@@ -878,6 +889,25 @@ class DashboardApp(App):
                 hay = " ".join((s.id, s.cwd, s.repository, s.branch, s.summary, s.pr)).lower()
                 if needle not in hay:
                     continue
+            visible.append(s)
+
+        # Pre-compute per-group counts for the separator labels.
+        group_counts: dict[str, int] = {}
+        if self.group_by_repo:
+            for s in visible:
+                k = s.repository or "—"
+                group_counts[k] = group_counts.get(k, 0) + 1
+
+        last_repo: str | None = None
+        for s in visible:
+            if self.group_by_repo:
+                repo = s.repository or "—"
+                if repo != last_repo:
+                    label = Text(f"▼ {repo}  ({group_counts[repo]})",
+                                 style="bold magenta")
+                    table.add_row(label, "", "", "", "", "", "", "", "")
+                    self.row_keys.append("")  # sentinel: separator row
+                    last_repo = repo
             repo_branch = s.repository or "—"
             if s.branch:
                 repo_branch = f"{repo_branch} ({s.branch})" if s.repository else s.branch
@@ -908,7 +938,7 @@ class DashboardApp(App):
             self.row_keys.append(s.id)
         status = self.query_one("#status", Static)
         total = len(self.sessions)
-        shown = len(self.row_keys)
+        shown = sum(1 for k in self.row_keys if k)  # exclude separators
         bits = [self._countdown_text(),
                 f"{shown}/{total} sessions"]
         if live_count:
@@ -919,6 +949,8 @@ class DashboardApp(App):
             bits.append(f"({hidden_empty} empty hidden — press 'a')")
         if self.live_only:
             bits.append("[live only — press 'l']")
+        if self.group_by_repo:
+            bits.append("[grouped by repo — press 'g']")
         bits.append(f"root: {SESSION_ROOT}")
         status.update("   ".join(bits))
         # Mirror to the header subtitle so it's always visible.
@@ -956,6 +988,10 @@ class DashboardApp(App):
 
     def action_toggle_live(self) -> None:
         self.live_only = not self.live_only
+        self._populate()
+
+    def action_toggle_group(self) -> None:
+        self.group_by_repo = not self.group_by_repo
         self._populate()
 
     def action_open_pr(self, url: str) -> None:

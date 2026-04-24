@@ -73,6 +73,7 @@ Re-run the install one-liner above — it overwrites the files in place.
 | `r`             | Reload sessions from disk                  |
 | `a`             | Toggle showing sessions with empty summary |
 | `l`             | Toggle live-only filter                    |
+| `g`             | Toggle group-by-repo                       |
 | `v`             | Open selected session folder in VSCode     |
 | `q`             | Quit                                       |
 
