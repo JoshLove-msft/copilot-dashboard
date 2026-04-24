@@ -778,6 +778,8 @@ class DashboardApp(App):
         yield Static("", id="status")
         yield Footer()
 
+    REFRESH_INTERVAL = 5.0  # seconds between auto-refreshes
+
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         # Reserve trailing space for the sort indicator on every label.
@@ -790,8 +792,11 @@ class DashboardApp(App):
         self._refresh_count: int = 0
         self.action_refresh()
         self.set_focus(table)
-        # Auto-refresh every 5 seconds; preserves cursor position.
-        self._auto_timer = self.set_interval(5.0, self._auto_refresh)
+        # Auto-refresh on a fixed interval; preserves cursor position.
+        self._auto_timer = self.set_interval(self.REFRESH_INTERVAL, self._auto_refresh)
+        # 1-second countdown ticker so the user can see when the next
+        # refresh will fire.
+        self.set_interval(1.0, self._tick_countdown)
 
     def _auto_refresh(self) -> None:
         # Wrap the whole thing so a single bad session never kills the timer.
@@ -904,7 +909,7 @@ class DashboardApp(App):
         status = self.query_one("#status", Static)
         total = len(self.sessions)
         shown = len(self.row_keys)
-        bits = [f"refreshed {self._refresh_age()} (#{self._refresh_count})",
+        bits = [self._countdown_text(),
                 f"{shown}/{total} sessions"]
         if live_count:
             bits.append(f"● {live_count} live")
@@ -918,7 +923,7 @@ class DashboardApp(App):
         status.update("   ".join(bits))
         # Mirror to the header subtitle so it's always visible.
         try:
-            self.sub_title = f"refreshed {self._refresh_age()} (#{self._refresh_count})"
+            self.sub_title = self._countdown_text()
         except Exception:
             pass
 
@@ -927,6 +932,23 @@ class DashboardApp(App):
             return "—"
         delta = max(0, int(time.time() - self.last_refresh))
         return f"{delta}s ago"
+
+    def _next_refresh_in(self) -> int:
+        if not getattr(self, "last_refresh", 0):
+            return int(self.REFRESH_INTERVAL)
+        remaining = self.REFRESH_INTERVAL - (time.time() - self.last_refresh)
+        return max(0, int(remaining + 0.5))
+
+    def _countdown_text(self) -> str:
+        return f"autorefresh in {self._next_refresh_in()}s (#{self._refresh_count})"
+
+    def _tick_countdown(self) -> None:
+        # Update only the lightweight bits (status bar prefix + sub_title) so
+        # we don't rebuild the table once a second.
+        try:
+            self.sub_title = self._countdown_text()
+        except Exception:
+            pass
 
     def action_toggle_empty(self) -> None:
         self.show_empty = not self.show_empty
