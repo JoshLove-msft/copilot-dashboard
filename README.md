@@ -73,6 +73,20 @@ script directly:
 & "$env:USERPROFILE\.copilot-dashboard\copilot-dash.ps1"
 ```
 
+## Configuration
+
+Press `s` inside the dashboard to open a settings modal. You can configure:
+
+- **`--yolo`** — pass `--yolo` to `copilot` for sessions launched from the
+  dashboard (allow all tools / paths / urls). Default **on**.
+- **`--autopilot`** — pass `--autopilot` so launched sessions auto-continue
+  without prompting between turns. Default **on**.
+- **Auto-refresh interval** — how often (in seconds) the dashboard re-reads
+  sessions from disk. Default **30**.
+
+Saved to `%USERPROFILE%\.copilot-dashboard\config.json`. You can also edit
+that file directly.
+
 ## Update
 
 Just run `cdash` again — the launcher pulls the latest `dashboard.py`,
@@ -104,6 +118,7 @@ scratch, re-run the install one-liner.
 | `l`                | Toggle live-only filter                                |
 | `g`                | Toggle group-by-repo                                   |
 | `v`                | Open selected session folder in VS Code                |
+| `s`                | Open settings (yolo / autopilot / refresh interval)    |
 | `q`                | Quit                                                   |
 
 ## How it works

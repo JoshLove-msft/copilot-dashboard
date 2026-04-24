@@ -37,15 +37,58 @@ from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static, Switch
 
 
 SESSION_ROOT = Path(os.environ.get("COPILOT_CONFIG_DIR", Path.home() / ".copilot")) / "session-state"
 SESSION_STORE_DB = Path(os.environ.get("COPILOT_CONFIG_DIR", Path.home() / ".copilot")) / "session-store.db"
 ACTIVE_WINDOW_SECONDS = 10 * 60  # session updated within 10 min => "recent"
-
-
 LIVE_WINDOW_SECONDS = 60  # events.jsonl touched within this => "live"
+
+CONFIG_PATH = Path.home() / ".copilot-dashboard" / "config.json"
+DEFAULT_CONFIG = {
+    "yolo": True,                # pass --yolo when launching copilot
+    "autopilot": True,           # pass --autopilot when launching copilot
+    "refresh_interval": 30,      # auto-refresh interval, seconds
+}
+
+
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k in cfg:
+                    if k in data:
+                        cfg[k] = data[k]
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(
+            json.dumps(cfg, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def copilot_command(cfg: dict, *, resume_id: str | None = None) -> str:
+    parts = ["copilot"]
+    if cfg.get("yolo"):
+        parts.append("--yolo")
+    if cfg.get("autopilot"):
+        parts.append("--autopilot")
+    if resume_id:
+        parts.append(f'--resume="{resume_id}"')
+    return " ".join(parts)
+
 
 
 @dataclass
@@ -673,13 +716,14 @@ def _spawn_wt(argv: list[str], cwd: str | None) -> tuple[bool, str]:
     return True, ""
 
 
-def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
+def launch_new_session(cwd: str | None = None, cfg: dict | None = None) -> tuple[bool, str]:
     """Open a fresh `copilot` session as a new WT tab."""
+    cfg = cfg or load_config()
     shell = _resolve_shell()
     cwd = cwd or os.getcwd()
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
-    inner = [shell, "-NoExit", "-Command", "copilot --yolo --autopilot"]
+    inner = [shell, "-NoExit", "-Command", copilot_command(cfg)]
     title = "copilot:new"
     wt = _resolve_wt()
     if wt:
@@ -713,15 +757,16 @@ def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
     return True, f"→ launched new copilot session in new console window (cwd: {cwd})"
 
 
-def launch_session_tab(session: "Session") -> tuple[bool, str]:
+def launch_session_tab(session: "Session", cfg: dict | None = None) -> tuple[bool, str]:
     """Open the session as a NEW TAB in the current WT window (or a new console).
 
     Uses `wt -w 0 new-tab` so each session becomes a tab in the user's existing
     WT window rather than spawning a separate window.
     """
+    cfg = cfg or load_config()
     shell = _resolve_shell()
     cwd = session.cwd or os.path.expanduser("~")
-    resume_cmd = f'copilot --yolo --autopilot --resume="{session.id}"'
+    resume_cmd = copilot_command(cfg, resume_id=session.id)
     inner = [shell, "-NoExit", "-Command", resume_cmd]
     # Prefer the session summary as the tab title; fall back to the short id.
     summary = (session.summary or "").strip()
@@ -779,6 +824,107 @@ def focus_session(session: "Session") -> tuple[bool, str]:
     return False, "no existing tab found"
 
 
+class SettingsScreen(ModalScreen[dict | None]):
+    """Modal for editing dashboard config (yolo, autopilot, refresh interval).
+
+    Dismisses with the new config dict on Save, or None on Cancel/Esc.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    SettingsScreen {
+        align: center middle;
+    }
+    SettingsScreen > Vertical {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    SettingsScreen .row {
+        height: 3;
+        align: left middle;
+    }
+    SettingsScreen .row Label {
+        width: 1fr;
+        content-align: left middle;
+        padding: 1 1;
+    }
+    SettingsScreen .row Switch,
+    SettingsScreen .row Input {
+        width: 12;
+    }
+    SettingsScreen #buttons {
+        height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    SettingsScreen #buttons Button {
+        margin-left: 1;
+    }
+    SettingsScreen #title {
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    SettingsScreen #help {
+        color: $text-muted;
+        padding-top: 1;
+    }
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__()
+        self._cfg = dict(cfg)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Settings", id="title")
+            with Horizontal(classes="row"):
+                yield Label("--yolo  (allow all tools/paths/urls)")
+                yield Switch(value=bool(self._cfg.get("yolo", True)), id="sw-yolo")
+            with Horizontal(classes="row"):
+                yield Label("--autopilot  (auto-continue without prompts)")
+                yield Switch(value=bool(self._cfg.get("autopilot", True)), id="sw-autopilot")
+            with Horizontal(classes="row"):
+                yield Label("Auto-refresh interval (seconds)")
+                yield Input(
+                    value=str(self._cfg.get("refresh_interval", 30)),
+                    id="in-refresh",
+                    restrict=r"\d*",
+                )
+            yield Static(
+                f"Config file: {CONFIG_PATH}",
+                id="help",
+            )
+            with Horizontal(id="buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Save", id="save", variant="primary")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "save":
+            try:
+                refresh = int(self.query_one("#in-refresh", Input).value or "30")
+            except ValueError:
+                refresh = 30
+            new_cfg = {
+                "yolo": self.query_one("#sw-yolo", Switch).value,
+                "autopilot": self.query_one("#sw-autopilot", Switch).value,
+                "refresh_interval": max(2, refresh),
+            }
+            self.dismiss(new_cfg)
+
+
+
 class DashboardApp(App):
     TITLE = "Copilot Dashboard"
     ENABLE_COMMAND_PALETTE = False
@@ -801,12 +947,14 @@ class DashboardApp(App):
         Binding("l", "toggle_live", "Live only"),
         Binding("g", "toggle_group", "Group by repo"),
         Binding("v", "open_in_vscode", "Open in VSCode"),
+        Binding("s", "open_settings", "Settings"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False),
     ]
 
     def __init__(self) -> None:
         super().__init__()
+        self.config: dict = load_config()
         self.sessions: list[Session] = []
         self.row_keys: list[str] = []  # session id per visible row
         self.filter_text: str = ""
@@ -825,9 +973,14 @@ class DashboardApp(App):
         yield Static("", id="status")
         yield Footer()
 
-    REFRESH_INTERVAL = 30.0  # seconds between auto-refreshes
+    REFRESH_INTERVAL = 30.0  # default; overridden by config['refresh_interval']
 
     def on_mount(self) -> None:
+        # Honor refresh_interval from config (clamped to a sane range).
+        try:
+            self.REFRESH_INTERVAL = max(2.0, float(self.config.get("refresh_interval", 30)))
+        except (TypeError, ValueError):
+            self.REFRESH_INTERVAL = 30.0
         table = self.query_one(DataTable)
         # Reserve trailing space for the sort indicator on every label.
         self._base_labels = [
@@ -1016,6 +1169,15 @@ class DashboardApp(App):
             suffix_bits.append("[live only — press 'l']")
         if self.group_by_repo:
             suffix_bits.append("[grouped by repo — press 'g']")
+        flags = []
+        if self.config.get("yolo"):
+            flags.append("yolo")
+        if self.config.get("autopilot"):
+            flags.append("autopilot")
+        if flags:
+            suffix_bits.append(f"launch: {'+'.join(flags)} (press 's')")
+        else:
+            suffix_bits.append("launch: default (press 's')")
         suffix_bits.append(f"root: {SESSION_ROOT}")
         self._status_suffix = "   ".join(suffix_bits)
         self._refresh_status_line()
@@ -1084,7 +1246,7 @@ class DashboardApp(App):
                     cwd = sess.cwd
         except Exception:
             pass
-        ok, msg = launch_new_session(cwd)
+        ok, msg = launch_new_session(cwd, cfg=self.config)
         self.query_one("#status", Static).update(msg if ok else f"[red]{msg}[/red]")
 
     def _selected_session(self) -> Session | None:
@@ -1118,6 +1280,29 @@ class DashboardApp(App):
             status.update(f"→ opened {target} in VSCode")
         except Exception as exc:
             status.update(f"[red]failed to launch VSCode: {exc}[/red]")
+
+    def action_open_settings(self) -> None:
+        def _on_close(result: dict | None) -> None:
+            if not result:
+                return
+            self.config.update(result)
+            save_config(self.config)
+            # Re-arm the autorefresh timer if the interval changed.
+            new_interval = max(2.0, float(self.config.get("refresh_interval", 30)))
+            if new_interval != self.REFRESH_INTERVAL:
+                self.REFRESH_INTERVAL = new_interval
+                try:
+                    if getattr(self, "_auto_timer", None):
+                        self._auto_timer.stop()
+                except Exception:
+                    pass
+                self._auto_timer = self.set_interval(self.REFRESH_INTERVAL, self._auto_refresh)
+                # Reset countdown anchor.
+                self.last_refresh = time.time()
+            self._populate()
+            self.query_one("#status", Static).update("→ settings saved")
+
+        self.push_screen(SettingsScreen(self.config), _on_close)
 
     def on_data_table_header_selected(self, event) -> None:
         col = getattr(event, "column_index", None)
@@ -1178,7 +1363,7 @@ class DashboardApp(App):
             status.update(msg)
             return
         # No existing tab (or focus failed) — launch a fresh one.
-        ok, msg = launch_session_tab(sess)
+        ok, msg = launch_session_tab(sess, cfg=self.config)
         status.update(msg if ok else f"[red]{msg}[/red]")
 
     PR_COL = 4  # index of the PR column in the table
