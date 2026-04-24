@@ -676,7 +676,9 @@ def launch_session_tab(session: "Session") -> tuple[bool, str]:
     cwd = session.cwd or os.path.expanduser("~")
     resume_cmd = f'copilot --resume="{session.id}"'
     inner = [shell, "-NoExit", "-Command", resume_cmd]
-    title = f"copilot:{session.short_id}"
+    # Prefer the session summary as the tab title; fall back to the short id.
+    summary = (session.summary or "").strip()
+    title = summary if summary else f"copilot:{session.short_id}"
 
     wt = _resolve_wt()
     if wt:
