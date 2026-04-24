@@ -738,6 +738,8 @@ def focus_session(session: "Session") -> tuple[bool, str]:
 
 
 class DashboardApp(App):
+    ENABLE_COMMAND_PALETTE = False
+
     CSS = """
     Screen { layout: vertical; }
     #search { dock: top; height: 3; display: none; }
@@ -784,31 +786,44 @@ class DashboardApp(App):
             "ID  ", "Repo / Branch  ", "CWD  ",
         ]
         self.col_keys = list(table.add_columns(*self._base_labels))
+        self.last_refresh: float = 0.0
+        self._refresh_count: int = 0
         self.action_refresh()
         self.set_focus(table)
         # Auto-refresh every 5 seconds; preserves cursor position.
-        self.set_interval(5.0, self._auto_refresh)
+        self._auto_timer = self.set_interval(5.0, self._auto_refresh)
 
     def _auto_refresh(self) -> None:
+        # Wrap the whole thing so a single bad session never kills the timer.
         try:
-            table = self.query_one(DataTable)
-            saved_row = table.cursor_row
-            saved_col = table.cursor_column
-        except Exception:
-            saved_row, saved_col = 0, 0
-        self.action_refresh()
-        try:
-            table = self.query_one(DataTable)
-            max_row = max(0, table.row_count - 1)
-            row = min(saved_row or 0, max_row)
-            col = saved_col or 0
-            table.move_cursor(row=row, column=col, animate=False)
-        except Exception:
-            pass
+            try:
+                table = self.query_one(DataTable)
+                saved_row = table.cursor_row
+                saved_col = table.cursor_column
+            except Exception:
+                saved_row, saved_col = 0, 0
+            self.action_refresh()
+            try:
+                table = self.query_one(DataTable)
+                max_row = max(0, table.row_count - 1)
+                row = min(saved_row or 0, max_row)
+                col = saved_col or 0
+                table.move_cursor(row=row, column=col, animate=False)
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                self.query_one("#status", Static).update(
+                    f"[red]auto-refresh error: {exc}[/red]"
+                )
+            except Exception:
+                pass
 
     def action_refresh(self) -> None:
         self.sessions = load_sessions()
         detect_live_sessions(self.sessions)
+        self.last_refresh = time.time()
+        self._refresh_count += 1
         self._populate()
 
     def _populate(self) -> None:
@@ -898,8 +913,15 @@ class DashboardApp(App):
             bits.append(f"({hidden_empty} empty hidden — press 'a')")
         if self.live_only:
             bits.append("[live only — press 'l']")
+        bits.append(f"refreshed {self._refresh_age()} (#{self._refresh_count})")
         bits.append(f"root: {SESSION_ROOT}")
         status.update("   ".join(bits))
+
+    def _refresh_age(self) -> str:
+        if not getattr(self, "last_refresh", 0):
+            return "—"
+        delta = max(0, int(time.time() - self.last_refresh))
+        return f"{delta}s ago"
 
     def action_toggle_empty(self) -> None:
         self.show_empty = not self.show_empty
