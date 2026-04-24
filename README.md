@@ -68,6 +68,8 @@ Re-run the install one-liner above — it overwrites the files in place.
 | `/`             | Toggle search/filter                       |
 | `Esc`           | Clear filter / close search                |
 | `r`             | Reload sessions from disk                  |
+| `a`             | Toggle showing sessions with empty summary |
+| `l`             | Toggle live-only filter                    |
 | `q`             | Quit                                       |
 
 ## How it works

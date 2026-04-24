@@ -679,6 +679,7 @@ class DashboardApp(App):
         Binding("escape", "clear_search", "Clear"),
         Binding("r", "refresh", "Refresh"),
         Binding("a", "toggle_empty", "Show empty"),
+        Binding("l", "toggle_live", "Live only"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False),
     ]
@@ -689,6 +690,7 @@ class DashboardApp(App):
         self.row_keys: list[str] = []  # session id per visible row
         self.filter_text: str = ""
         self.show_empty: bool = False  # hide sessions with no summary by default
+        self.live_only: bool = False   # when True, hide non-live sessions
         self.sort_col: int | None = None  # None → default tier sort
         self.sort_desc: bool = False
 
@@ -754,6 +756,7 @@ class DashboardApp(App):
         live_count = 0
         recent_count = 0
         hidden_empty = 0
+        hidden_nonlive = 0
         # If user picked a sort column, use it; otherwise default tiered sort.
         if self.sort_col is not None and self.sort_col in self._sort_keys:
             _, keyfn, _ = self._sort_keys[self.sort_col]
@@ -770,6 +773,9 @@ class DashboardApp(App):
                 live_count += 1
             elif s.is_recent:
                 recent_count += 1
+            if self.live_only and not s.is_live:
+                hidden_nonlive += 1
+                continue
             if not self.show_empty and not (s.summary or "").strip() and not s.is_live:
                 hidden_empty += 1
                 continue
@@ -814,11 +820,17 @@ class DashboardApp(App):
             bits.append(f"○ {recent_count} recent")
         if hidden_empty:
             bits.append(f"({hidden_empty} empty hidden — press 'a')")
+        if self.live_only:
+            bits.append("[live only — press 'l']")
         bits.append(f"root: {SESSION_ROOT}")
         status.update("   ".join(bits))
 
     def action_toggle_empty(self) -> None:
         self.show_empty = not self.show_empty
+        self._populate()
+
+    def action_toggle_live(self) -> None:
+        self.live_only = not self.live_only
         self._populate()
 
     def action_open_pr(self, url: str) -> None:
