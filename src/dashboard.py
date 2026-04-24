@@ -940,7 +940,7 @@ class DashboardApp(App):
         return max(0, int(remaining + 0.5))
 
     def _countdown_text(self) -> str:
-        return f"autorefresh in {self._next_refresh_in()}s (#{self._refresh_count})"
+        return f"autorefresh in {self._next_refresh_in()}s"
 
     def _tick_countdown(self) -> None:
         # Update only the lightweight bits (status bar prefix + sub_title) so
