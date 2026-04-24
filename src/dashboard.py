@@ -1157,11 +1157,25 @@ class DashboardApp(App):
                 return
         self._jump_row(row_idx)
 
+    def _toggle_collapse(self, repo: str, force: bool | None = None) -> None:
+        """Toggle (or set) collapsed state for a repo group, then re-render."""
+        if force is True or (force is None and repo not in self.collapsed_repos):
+            self.collapsed_repos.add(repo)
+        else:
+            self.collapsed_repos.discard(repo)
+        self._populate()
+        try:
+            table = self.query_one(DataTable)
+            new_idx = next((i for i, r in self._separator_repos.items() if r == repo), 0)
+            table.move_cursor(row=new_idx, column=0, animate=False)
+        except Exception:
+            pass
+
     def on_key(self, event) -> None:
-        """Intercept left/right on a repo separator row to toggle collapse."""
+        """Intercept left/right/space on a repo separator row to toggle collapse."""
         if not self.group_by_repo:
             return
-        if event.key not in ("right", "left"):
+        if event.key not in ("right", "left", "space"):
             return
         try:
             table = self.query_one(DataTable)
@@ -1172,40 +1186,37 @@ class DashboardApp(App):
         if repo is None:
             return  # not a separator row — let default cursor movement happen
         if event.key == "right":
-            self.collapsed_repos.add(repo)
-        else:
-            self.collapsed_repos.discard(repo)
+            self._toggle_collapse(repo, force=True)
+        elif event.key == "left":
+            self._toggle_collapse(repo, force=False)
+        else:  # space
+            self._toggle_collapse(repo)
         event.stop()
         try:
             event.prevent_default()
         except Exception:
             pass
-        self._populate()
-        # Restore cursor onto the same separator row after rebuild.
-        try:
-            table = self.query_one(DataTable)
-            new_idx = next((i for i, r in self._separator_repos.items() if r == repo), 0)
-            table.move_cursor(row=new_idx, column=0, animate=False)
-        except Exception:
-            pass
 
     def on_data_table_cell_selected(self, event) -> None:
         coord = getattr(event, "coordinate", None)
-        if coord is not None:
-            self._activate(coord.row, coord.column)
+        row = coord.row if coord is not None else None
+        col = coord.column if coord is not None else None
+        if row is None:
+            try:
+                table = self.query_one(DataTable)
+                row, col = table.cursor_row, table.cursor_column
+            except Exception:
+                return
+        # If this is a repo separator row, toggle its collapsed state.
+        if self.group_by_repo and row in self._separator_repos:
+            self._toggle_collapse(self._separator_repos[row])
             return
-        # Fallback if no coordinate on event
-        try:
-            table = self.query_one(DataTable)
-            self._activate(table.cursor_row, table.cursor_column)
-        except Exception:
-            pass
+        self._activate(row, col)
 
     def on_click(self, event) -> None:
         # Single click on PR cells is handled by the @click meta on the Text.
-        # Here we only handle double-click on a row → activate (jump).
-        if getattr(event, "chain", 1) < 2:
-            return
+        # Single click on a repo separator row toggles collapse.
+        # Double click on a session row → activate (jump).
         try:
             table = self.query_one(DataTable)
         except Exception:
@@ -1220,7 +1231,15 @@ class DashboardApp(App):
             node = getattr(node, "parent", None)
         if not on_table:
             return
-        self._activate(table.cursor_row, table.cursor_column)
+        chain = getattr(event, "chain", 1)
+        row = table.cursor_row
+        # Single-click on a separator row toggles collapse for that group.
+        if self.group_by_repo and row in self._separator_repos:
+            self._toggle_collapse(self._separator_repos[row])
+            return
+        if chain < 2:
+            return
+        self._activate(row, table.cursor_column)
 
     def action_jump(self) -> None:
         try:
