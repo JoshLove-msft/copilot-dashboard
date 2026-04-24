@@ -80,6 +80,11 @@ class Session:
     def is_live(self) -> bool:
         if self.running:
             return True
+        # If the events log shows a definitive shutdown/abort, trust that
+        # over the mtime heuristic — otherwise we'd flag a just-exited
+        # session as LIVE simply because events.jsonl was touched seconds ago.
+        if self.agent_state == "done":
+            return False
         if self.events_mtime <= 0:
             return False
         return (time.time() - self.events_mtime) <= LIVE_WINDOW_SECONDS
