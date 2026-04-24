@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 import sys
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -842,8 +843,9 @@ class DashboardApp(App):
         # refresh will fire.
         self.set_interval(1.0, self._tick_countdown)
 
-    def _auto_refresh(self) -> None:
-        # Wrap the whole thing so a single bad session never kills the timer.
+    async def _auto_refresh(self) -> None:
+        # Run heavy I/O off the asyncio thread so the loop (and the 1s
+        # countdown ticker) keep firing during refresh.
         try:
             try:
                 table = self.query_one(DataTable)
@@ -851,7 +853,21 @@ class DashboardApp(App):
                 saved_col = table.cursor_column
             except Exception:
                 saved_row, saved_col = 0, 0
-            self.action_refresh()
+            try:
+                sessions = await asyncio.to_thread(load_sessions)
+                await asyncio.to_thread(detect_live_sessions, sessions)
+            except Exception as exc:
+                try:
+                    self.query_one("#status", Static).update(
+                        f"[red]auto-refresh error: {exc}[/red]"
+                    )
+                except Exception:
+                    pass
+                return
+            self.sessions = sessions
+            self.last_refresh = time.time()
+            self._refresh_count += 1
+            self._populate()
             try:
                 table = self.query_one(DataTable)
                 max_row = max(0, table.row_count - 1)
@@ -987,25 +1003,20 @@ class DashboardApp(App):
         status = self.query_one("#status", Static)
         total = len(self.sessions)
         shown = sum(1 for k in self.row_keys if k)  # exclude separators
-        bits = [self._countdown_text(),
-                f"{shown}/{total} sessions"]
+        suffix_bits = [f"{shown}/{total} sessions"]
         if live_count:
-            bits.append(f"● {live_count} live")
+            suffix_bits.append(f"● {live_count} live")
         if recent_count:
-            bits.append(f"○ {recent_count} recent")
+            suffix_bits.append(f"○ {recent_count} recent")
         if hidden_empty:
-            bits.append(f"({hidden_empty} empty hidden — press 'a')")
+            suffix_bits.append(f"({hidden_empty} empty hidden — press 'a')")
         if self.live_only:
-            bits.append("[live only — press 'l']")
+            suffix_bits.append("[live only — press 'l']")
         if self.group_by_repo:
-            bits.append("[grouped by repo — press 'g']")
-        bits.append(f"root: {SESSION_ROOT}")
-        status.update("   ".join(bits))
-        # Mirror to the header subtitle so it's always visible.
-        try:
-            self.sub_title = self._countdown_text()
-        except Exception:
-            pass
+            suffix_bits.append("[grouped by repo — press 'g']")
+        suffix_bits.append(f"root: {SESSION_ROOT}")
+        self._status_suffix = "   ".join(suffix_bits)
+        self._refresh_status_line()
 
     def _refresh_age(self) -> str:
         if not getattr(self, "last_refresh", 0):
@@ -1022,13 +1033,24 @@ class DashboardApp(App):
     def _countdown_text(self) -> str:
         return f"autorefresh in {self._next_refresh_in()}s"
 
-    def _tick_countdown(self) -> None:
-        # Update only the lightweight bits (status bar prefix + sub_title) so
-        # we don't rebuild the table once a second.
+    def _refresh_status_line(self) -> None:
+        """Update the bottom status bar + header subtitle with the live countdown.
+
+        Cheap to call repeatedly (no table rebuild)."""
+        try:
+            suffix = getattr(self, "_status_suffix", "")
+            text = f"{self._countdown_text()}   {suffix}" if suffix else self._countdown_text()
+            self.query_one("#status", Static).update(text)
+        except Exception:
+            pass
         try:
             self.sub_title = self._countdown_text()
         except Exception:
             pass
+
+    def _tick_countdown(self) -> None:
+        # Refresh just the countdown bits — no table work.
+        self._refresh_status_line()
 
     def action_toggle_empty(self) -> None:
         self.show_empty = not self.show_empty
