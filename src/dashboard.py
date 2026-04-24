@@ -770,6 +770,8 @@ class DashboardApp(App):
         self.show_empty: bool = False  # hide sessions with no summary by default
         self.live_only: bool = False   # when True, hide non-live sessions
         self.group_by_repo: bool = False  # when True, group rows by repository
+        self.collapsed_repos: set[str] = set()  # repos collapsed in group view
+        self._separator_repos: dict[int, str] = {}  # row index -> repo name
         self.sort_col: int | None = None  # None → default tier sort
         self.sort_desc: bool = False
 
@@ -899,15 +901,21 @@ class DashboardApp(App):
                 group_counts[k] = group_counts.get(k, 0) + 1
 
         last_repo: str | None = None
+        self._separator_repos = {}
         for s in visible:
             if self.group_by_repo:
                 repo = s.repository or "—"
                 if repo != last_repo:
-                    label = Text(f"▼ {repo}  ({group_counts[repo]})",
+                    is_collapsed = repo in self.collapsed_repos
+                    marker = "▶" if is_collapsed else "▼"
+                    label = Text(f"{marker} {repo}  ({group_counts[repo]})",
                                  style="bold magenta")
                     table.add_row(label, "", "", "", "", "", "", "", "")
+                    self._separator_repos[len(self.row_keys)] = repo
                     self.row_keys.append("")  # sentinel: separator row
                     last_repo = repo
+                if repo in self.collapsed_repos:
+                    continue  # skip rows in collapsed groups
             repo_branch = s.repository or "—"
             if s.branch:
                 repo_branch = f"{repo_branch} ({s.branch})" if s.repository else s.branch
@@ -1148,6 +1156,38 @@ class DashboardApp(App):
                 self.query_one("#status", Static).update(f"→ opened {sess.pr_url}")
                 return
         self._jump_row(row_idx)
+
+    def on_key(self, event) -> None:
+        """Intercept left/right on a repo separator row to toggle collapse."""
+        if not self.group_by_repo:
+            return
+        if event.key not in ("right", "left"):
+            return
+        try:
+            table = self.query_one(DataTable)
+            row_idx = table.cursor_row
+        except Exception:
+            return
+        repo = self._separator_repos.get(row_idx)
+        if repo is None:
+            return  # not a separator row — let default cursor movement happen
+        if event.key == "right":
+            self.collapsed_repos.add(repo)
+        else:
+            self.collapsed_repos.discard(repo)
+        event.stop()
+        try:
+            event.prevent_default()
+        except Exception:
+            pass
+        self._populate()
+        # Restore cursor onto the same separator row after rebuild.
+        try:
+            table = self.query_one(DataTable)
+            new_idx = next((i for i, r in self._separator_repos.items() if r == repo), 0)
+            table.move_cursor(row=new_idx, column=0, animate=False)
+        except Exception:
+            pass
 
     def on_data_table_cell_selected(self, event) -> None:
         coord = getattr(event, "coordinate", None)
