@@ -32,8 +32,13 @@ if (-not $skip) {
         foreach ($f in $files) {
             $dest = Join-Path $root $f
             $tmp  = "$dest.new"
+            # Cache-buster + no-cache header: raw.githubusercontent.com is fronted
+            # by a CDN that can serve stale content for several minutes after a
+            # push. The ?t=<ticks> query string + header forces a fresh fetch.
+            $bust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
             Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 `
-                -Uri "$srcBase/$f" -OutFile $tmp
+                -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' } `
+                -Uri "$srcBase/$f`?t=$bust" -OutFile $tmp
             Move-Item -Force $tmp $dest
         }
         Write-Host ' done' -ForegroundColor Green
