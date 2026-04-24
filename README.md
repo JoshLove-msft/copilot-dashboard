@@ -19,6 +19,9 @@ any of them in a new terminal tab.
 - Marks a session **● LIVE** when a `copilot` process is currently holding
   that session's files open, or its `events.jsonl` was touched in the last
   60 s.
+- Shows the **Agent** state for each session — `▶ working` (mid-turn or
+  user message awaiting reply), `… waiting` (turn finished, waiting on you),
+  or `✓ done` (process exited).
 - Live sessions are sorted to the top of the list, then "recent" sessions,
   then everything else (newest first within each group).
 - Search/filter with `/`, refresh with `r`.

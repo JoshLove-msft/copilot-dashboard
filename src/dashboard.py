@@ -63,6 +63,7 @@ class Session:
     pr: str = ""  # PR ref like "#1234" if this session created/touched a PR
     pr_url: str = ""  # Full URL to the PR, when known
     turns: int = 0  # number of user/assistant turns in this session
+    agent_state: str = ""  # "working" | "waiting" | "done" | ""
 
     @property
     def short_id(self) -> str:
@@ -172,25 +173,72 @@ def load_sessions(root: Path = SESSION_ROOT) -> list[Session]:
     return sessions
 
 
-_TURNS_CACHE: dict[str, tuple[float, int]] = {}  # session_id → (events_mtime, count)
+_TURNS_CACHE: dict[str, tuple[float, int, str]] = {}  # session_id → (events_mtime, turns, agent_state)
 
 
-def _count_turns(events_path: Path, mtime: float) -> int:
-    """Count user.message events in a session's events.jsonl, cached by mtime."""
+def _scan_events(events_path: Path, mtime: float) -> tuple[int, str]:
+    """Return (turn_count, agent_state) for a session's events.jsonl, cached
+    by mtime.
+
+    agent_state is one of:
+      - "working" : agent is mid-turn (turn_start without matching turn_end,
+        or a user.message just queued for the agent)
+      - "waiting" : agent finished its turn and is awaiting user input
+      - "done"    : final event indicates the session shut down / aborted
+      - ""        : unknown (empty file)
+    """
     sid = events_path.parent.name
     cached = _TURNS_CACHE.get(sid)
     if cached and cached[0] == mtime:
-        return cached[1]
+        return cached[1], cached[2]
     n = 0
+    # Track line index of the last occurrence of each interesting marker.
+    last_turn_start = -1
+    last_turn_end = -1
+    last_user_msg = -1
+    last_shutdown = -1
+    last_abort = -1
+    idx = -1
     try:
         with events_path.open("rb") as f:
-            for line in f:
+            for idx, line in enumerate(f):
                 if b'"user.message"' in line:
                     n += 1
+                    last_user_msg = idx
+                if b'"assistant.turn_start"' in line:
+                    last_turn_start = idx
+                elif b'"assistant.turn_end"' in line:
+                    last_turn_end = idx
+                if b'"session.shutdown"' in line:
+                    last_shutdown = idx
+                elif b'"abort"' in line:
+                    last_abort = idx
     except OSError:
-        return cached[1] if cached else 0
-    _TURNS_CACHE[sid] = (mtime, n)
-    return n
+        if cached:
+            return cached[1], cached[2]
+        return 0, ""
+
+    last_done = max(last_shutdown, last_abort)
+    last_active = max(last_turn_start, last_user_msg)
+    if idx < 0:
+        state = ""
+    elif last_done > max(last_active, last_turn_end):
+        state = "done"
+    elif last_turn_start > last_turn_end or last_user_msg > last_turn_end:
+        # In the middle of a turn, or user sent a message and the agent
+        # hasn't replied yet.
+        state = "working"
+    elif last_turn_end >= 0:
+        state = "waiting"
+    else:
+        state = ""
+    _TURNS_CACHE[sid] = (mtime, n, state)
+    return n, state
+
+
+def _count_turns(events_path: Path, mtime: float) -> int:
+    """Backward-compatible turn counter (delegates to _scan_events)."""
+    return _scan_events(events_path, mtime)[0]
 
 
 def _attach_store_data(sessions: list[Session]) -> None:
@@ -210,12 +258,12 @@ def _attach_store_data(sessions: list[Session]) -> None:
     except sqlite3.Error:
         return
     try:
-        # Turn counts come from events.jsonl (real-time). The session-store.db
-        # value is a stale snapshot from checkpoints.
+        # Turn counts + agent state come from events.jsonl (real-time). The
+        # session-store.db value is a stale snapshot from checkpoints.
         for sess in sessions:
             ev = SESSION_ROOT / sess.id / "events.jsonl"
             if ev.exists() and sess.events_mtime > 0:
-                sess.turns = _count_turns(ev, sess.events_mtime)
+                sess.turns, sess.agent_state = _scan_events(ev, sess.events_mtime)
         # PR refs (highest-numbered per session).
         best: dict[str, int] = {}
         try:
@@ -344,6 +392,25 @@ def truncate(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[: n - 1] + "…"
+
+
+_AGENT_LABELS = {
+    "working": ("▶ working", "yellow"),
+    "waiting": ("… waiting", "cyan"),
+    "done":    ("✓ done",    "green"),
+}
+
+
+def _agent_cell(s: "Session") -> object:
+    """Render the agent state column with light color hinting."""
+    state = s.agent_state
+    if not s.is_live:
+        # Once the process is gone, the session is effectively done.
+        state = "done" if state else ""
+    if not state:
+        return ""
+    label, color = _AGENT_LABELS.get(state, (state, "white"))
+    return Text(label, style=color)
 
 
 # ─── Tab launching ──────────────────────────────────────────────────────────
@@ -706,7 +773,7 @@ class DashboardApp(App):
         table = self.query_one(DataTable)
         # Reserve trailing space for the sort indicator on every label.
         self._base_labels = [
-            "Summary  ", " ", "Turns  ", "PR  ", "Updated  ",
+            "Summary  ", " ", "Agent  ", "Turns  ", "PR  ", "Updated  ",
             "ID  ", "Repo / Branch  ", "CWD  ",
         ]
         self.col_keys = list(table.add_columns(*self._base_labels))
@@ -803,6 +870,7 @@ class DashboardApp(App):
             table.add_row(
                 truncate(s.summary or "—", 50),
                 s.status,
+                _agent_cell(s),
                 str(s.turns) if s.turns else "",
                 pr_cell,
                 humanize_age(s.updated_at),
@@ -949,7 +1017,7 @@ class DashboardApp(App):
         ok, msg = launch_session_tab(sess)
         status.update(msg if ok else f"[red]{msg}[/red]")
 
-    PR_COL = 3  # index of the PR column in the table
+    PR_COL = 4  # index of the PR column in the table
 
     # Map column index → (label, key function on Session, default descending?)
     @staticmethod
@@ -961,15 +1029,18 @@ class DashboardApp(App):
 
     @property
     def _sort_keys(self):
+        # Order: working first, then waiting, then done, then unknown.
+        agent_order = {"working": 0, "waiting": 1, "done": 2, "": 3}
         return {
             0: ("Summary",      lambda s: (s.summary or "").lower(),       False),
             1: ("Status",       lambda s: (0 if s.is_live else (1 if s.is_recent else 2)), False),
-            2: ("Turns",        lambda s: s.turns,                         True),
-            3: ("PR",           lambda s: self._pr_int(s),                 True),
-            4: ("Updated",      lambda s: (s.updated_at or datetime.fromtimestamp(s.mtime, tz=timezone.utc)).timestamp(), True),
-            5: ("ID",           lambda s: s.short_id,                      False),
-            6: ("Repo/Branch",  lambda s: (s.repository or "").lower() + " " + (s.branch or "").lower(), False),
-            7: ("CWD",          lambda s: (s.cwd or "").lower(),           False),
+            2: ("Agent",        lambda s: agent_order.get(s.agent_state, 9), False),
+            3: ("Turns",        lambda s: s.turns,                         True),
+            4: ("PR",           lambda s: self._pr_int(s),                 True),
+            5: ("Updated",      lambda s: (s.updated_at or datetime.fromtimestamp(s.mtime, tz=timezone.utc)).timestamp(), True),
+            6: ("ID",           lambda s: s.short_id,                      False),
+            7: ("Repo/Branch",  lambda s: (s.repository or "").lower() + " " + (s.branch or "").lower(), False),
+            8: ("CWD",          lambda s: (s.cwd or "").lower(),           False),
         }
 
     def _activate(self, row_idx: int | None, col_idx: int | None) -> None:
