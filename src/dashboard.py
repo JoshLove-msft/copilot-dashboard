@@ -680,6 +680,7 @@ class DashboardApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("a", "toggle_empty", "Show empty"),
         Binding("l", "toggle_live", "Live only"),
+        Binding("v", "open_in_vscode", "Open in VSCode"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", "Quit", show=False),
     ]
@@ -853,6 +854,38 @@ class DashboardApp(App):
             pass
         ok, msg = launch_new_session(cwd)
         self.query_one("#status", Static).update(msg if ok else f"[red]{msg}[/red]")
+
+    def _selected_session(self) -> Session | None:
+        try:
+            table = self.query_one(DataTable)
+            idx = table.cursor_row
+            if idx is None or not (0 <= idx < len(self.row_keys)):
+                return None
+            sid = self.row_keys[idx]
+            return next((s for s in self.sessions if s.id == sid), None)
+        except Exception:
+            return None
+
+    def action_open_in_vscode(self) -> None:
+        sess = self._selected_session()
+        if sess is None:
+            return
+        target = SESSION_ROOT / sess.id
+        status = self.query_one("#status", Static)
+        # Find the `code` launcher (Windows ships it as code.cmd on PATH).
+        code = shutil.which("code") or shutil.which("code.cmd") or shutil.which("code-insiders")
+        if not code:
+            status.update("[red]'code' not found on PATH[/red]")
+            return
+        try:
+            subprocess.Popen(
+                [code, str(target)],
+                shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            status.update(f"→ opened {target} in VSCode")
+        except Exception as exc:
+            status.update(f"[red]failed to launch VSCode: {exc}[/red]")
 
     def on_data_table_header_selected(self, event) -> None:
         col = getattr(event, "column_index", None)
