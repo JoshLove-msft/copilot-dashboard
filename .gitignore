@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.deps-installed
+.venv/
+.vscode/
+.idea/
+*.log
