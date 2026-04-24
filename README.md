@@ -31,7 +31,7 @@ any of them in a new terminal tab.
 One line in PowerShell (Windows):
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main/install/install.ps1 | iex
 ```
 
 That downloads the dashboard into `%USERPROFILE%\.copilot-dashboard` and

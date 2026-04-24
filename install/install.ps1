@@ -1,7 +1,7 @@
 # Copilot Dashboard installer.
 #
 # One-line install (PowerShell):
-#   iwr -useb https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main/install.ps1 | iex
+#   iwr -useb https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main/install/install.ps1 | iex
 #
 # Downloads the dashboard files into  $env:USERPROFILE\.copilot-dashboard
 # and installs Python deps. Run with:
@@ -20,8 +20,10 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     throw "'python' is required but was not found on PATH."
 }
 
-$base  = "https://raw.githubusercontent.com/$Owner/$RepoName/$Branch"
-$files = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt', 'README.md', 'LICENSE')
+$base    = "https://raw.githubusercontent.com/$Owner/$RepoName/$Branch"
+$srcBase = "$base/src"
+$files   = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt')
+$rootFiles = @('README.md', 'LICENSE')
 
 Write-Host "Installing Copilot Dashboard..." -ForegroundColor Cyan
 Write-Host "  source : $Owner/$RepoName@$Branch"
@@ -31,6 +33,10 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 foreach ($f in $files) {
+    Write-Host "  -> $f" -ForegroundColor DarkGray
+    Invoke-WebRequest -UseBasicParsing -Uri "$srcBase/$f" -OutFile (Join-Path $InstallDir $f)
+}
+foreach ($f in $rootFiles) {
     Write-Host "  -> $f" -ForegroundColor DarkGray
     Invoke-WebRequest -UseBasicParsing -Uri "$base/$f" -OutFile (Join-Path $InstallDir $f)
 }
