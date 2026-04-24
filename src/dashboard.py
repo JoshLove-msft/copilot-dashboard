@@ -904,7 +904,8 @@ class DashboardApp(App):
         status = self.query_one("#status", Static)
         total = len(self.sessions)
         shown = len(self.row_keys)
-        bits = [f"{shown}/{total} sessions"]
+        bits = [f"refreshed {self._refresh_age()} (#{self._refresh_count})",
+                f"{shown}/{total} sessions"]
         if live_count:
             bits.append(f"● {live_count} live")
         if recent_count:
@@ -913,9 +914,13 @@ class DashboardApp(App):
             bits.append(f"({hidden_empty} empty hidden — press 'a')")
         if self.live_only:
             bits.append("[live only — press 'l']")
-        bits.append(f"refreshed {self._refresh_age()} (#{self._refresh_count})")
         bits.append(f"root: {SESSION_ROOT}")
         status.update("   ".join(bits))
+        # Mirror to the header subtitle so it's always visible.
+        try:
+            self.sub_title = f"refreshed {self._refresh_age()} (#{self._refresh_count})"
+        except Exception:
+            pass
 
     def _refresh_age(self) -> str:
         if not getattr(self, "last_refresh", 0):
