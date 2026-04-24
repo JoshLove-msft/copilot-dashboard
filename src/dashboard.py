@@ -683,9 +683,11 @@ def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
     title = "copilot:new"
     wt = _resolve_wt()
     if wt:
+        # Note: deliberately NOT passing --suppressApplicationTitle here.
+        # We want the `copilot` CLI to update the WT tab title to the session
+        # summary once it has one. We pass --title only as an initial label.
         argv = [
             wt, "-w", "0", "new-tab",
-            "--suppressApplicationTitle",
             "--title", title,
             "-d", cwd,
             "--", *inner,
