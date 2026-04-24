@@ -637,10 +637,47 @@ def _select_tab(tab, wt) -> None:
         pass
 
 
+def _spawn_wt(argv: list[str], cwd: str | None) -> tuple[bool, str]:
+    """Spawn a wt.exe command, fully detached, and capture stderr on failure.
+
+    wt.exe is a thin dispatcher that exits almost immediately after handing
+    work off to the real WindowsTerminal.exe. We wait briefly for that exit
+    so we can surface a meaningful error if it failed (bad -d, malformed
+    args, no WT installed, etc.) instead of silently doing nothing.
+    """
+    DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
+    NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    flags = DETACHED | NEW_GROUP | NO_WINDOW
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd if (cwd and os.path.isdir(cwd)) else None,
+            creationflags=flags,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return False, f"launch failed: {e}"
+    try:
+        _, err = proc.communicate(timeout=4)
+    except subprocess.TimeoutExpired:
+        # wt has handed off to WT; no error means success.
+        return True, ""
+    if proc.returncode != 0:
+        msg = (err.decode("utf-8", "replace").strip().splitlines() or [""])[0]
+        return False, f"wt exited {proc.returncode}: {msg or 'no output'}"
+    return True, ""
+
+
 def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
     """Open a fresh `copilot` session as a new WT tab."""
     shell = _resolve_shell()
     cwd = cwd or os.getcwd()
+    if not os.path.isdir(cwd):
+        cwd = os.path.expanduser("~")
     inner = [shell, "-NoExit", "-Command", "copilot"]
     title = "copilot:new"
     wt = _resolve_wt()
@@ -650,25 +687,27 @@ def launch_new_session(cwd: str | None = None) -> tuple[bool, str]:
             "--suppressApplicationTitle",
             "--title", title,
             "-d", cwd,
-            *inner,
+            "--", *inner,
         ]
-        mode = "new tab"
-    else:
-        argv = inner
-        mode = "new console window"
+        ok, err = _spawn_wt(argv, cwd)
+        if not ok:
+            return False, err
+        return True, f"→ launched new copilot session in new tab (cwd: {cwd})"
+
+    # No wt — spawn a detached console window.
     try:
         creationflags = 0
-        if not wt and sys.platform == "win32":
+        if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
         subprocess.Popen(
-            argv,
-            cwd=cwd if os.path.isdir(cwd) else None,
+            inner,
+            cwd=cwd,
             creationflags=creationflags,
             close_fds=True,
         )
     except (OSError, FileNotFoundError) as e:
         return False, f"launch failed: {e}"
-    return True, f"→ launched new copilot session in {mode} (cwd: {cwd})"
+    return True, f"→ launched new copilot session in new console window (cwd: {cwd})"
 
 
 def launch_session_tab(session: "Session") -> tuple[bool, str]:
@@ -692,28 +731,28 @@ def launch_session_tab(session: "Session") -> tuple[bool, str]:
             "--suppressApplicationTitle",
             "--title", title,
             "-d", cwd,
-            *inner,
+            "--", *inner,
         ]
-        mode = "new tab"
-    else:
-        argv = inner
-        mode = "new console window"
+        ok, err = _spawn_wt(argv, cwd)
+        if not ok:
+            return False, err
+        _record_spawn(session, "tab")
+        return True, f"→ launched {session.short_id} as new tab"
 
+    # No wt — spawn a detached console window.
     try:
         creationflags = 0
-        if not wt and sys.platform == "win32":
+        if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
         subprocess.Popen(
-            argv,
+            inner,
             cwd=cwd if os.path.isdir(cwd) else None,
             creationflags=creationflags,
             close_fds=True,
         )
     except (OSError, FileNotFoundError) as e:
         return False, f"launch failed: {e}"
-    if wt:
-        _record_spawn(session, "tab")
-    return True, f"→ launched {session.short_id} as {mode}"
+    return True, f"→ launched {session.short_id} as new console window"
 
 
 def focus_session(session: "Session") -> tuple[bool, str]:
