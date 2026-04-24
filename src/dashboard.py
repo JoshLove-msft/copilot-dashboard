@@ -999,13 +999,37 @@ class DashboardApp(App):
         self.col_keys = list(table.add_columns(*self._base_labels))
         self.last_refresh: float = 0.0
         self._refresh_count: int = 0
-        self.action_refresh()
+        # Show an immediate "loading" hint so the first paint isn't a blank
+        # screen — the actual session scan + psutil sweep can take several
+        # seconds on a busy machine. Run it in a worker so the UI mounts
+        # right away.
+        self.query_one("#status", Static).update(
+            "[yellow]⏳ loading sessions…[/yellow]"
+        )
         self.set_focus(table)
+        self.run_worker(self._initial_load(), exclusive=False)
         # Auto-refresh on a fixed interval; preserves cursor position.
         self._auto_timer = self.set_interval(self.REFRESH_INTERVAL, self._auto_refresh)
         # 1-second countdown ticker so the user can see when the next
         # refresh will fire.
         self.set_interval(1.0, self._tick_countdown)
+
+    async def _initial_load(self) -> None:
+        try:
+            sessions = await asyncio.to_thread(load_sessions)
+            await asyncio.to_thread(detect_live_sessions, sessions)
+        except Exception as exc:
+            try:
+                self.query_one("#status", Static).update(
+                    f"[red]load error: {exc}[/red]"
+                )
+            except Exception:
+                pass
+            return
+        self.sessions = sessions
+        self.last_refresh = time.time()
+        self._refresh_count += 1
+        self._populate()
 
     async def _auto_refresh(self) -> None:
         # Run heavy I/O off the asyncio thread so the loop (and the 1s
@@ -1262,17 +1286,26 @@ class DashboardApp(App):
         self._run_launch(lambda: launch_new_session(cwd, cfg=self.config))
 
     def _run_launch(self, fn) -> None:
-        """Run a blocking launch/focus call in a worker so the UI stays responsive."""
-        def _worker() -> None:
+        """Run a blocking launch/focus call without freezing the UI.
+
+        We yield to the event loop once so the spinner status update from the
+        caller actually paints before we kick off the (potentially fast)
+        worker — otherwise a sub-frame worker completion races the renderer
+        and the user never sees the spinner.
+        """
+        async def _runner() -> None:
+            # Force a paint of the spinner status before doing any work.
+            await asyncio.sleep(0.05)
             try:
-                ok, msg = fn()
+                ok, msg = await asyncio.to_thread(fn)
             except Exception as exc:  # pragma: no cover - defensive
                 ok, msg = False, f"launch error: {exc}"
             text = msg if ok else f"[red]{msg}[/red]"
-            self.call_from_thread(
-                lambda: self.query_one("#status", Static).update(text)
-            )
-        self.run_worker(_worker, thread=True, exclusive=False)
+            try:
+                self.query_one("#status", Static).update(text)
+            except Exception:
+                pass
+        self.run_worker(_runner(), exclusive=False)
 
     def _selected_session(self) -> Session | None:
         try:
