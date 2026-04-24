@@ -777,6 +777,7 @@ def focus_session(session: "Session") -> tuple[bool, str]:
 
 
 class DashboardApp(App):
+    TITLE = "Copilot Dashboard"
     ENABLE_COMMAND_PALETTE = False
 
     CSS = """
