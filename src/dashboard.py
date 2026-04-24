@@ -778,7 +778,7 @@ class DashboardApp(App):
         yield Static("", id="status")
         yield Footer()
 
-    REFRESH_INTERVAL = 5.0  # seconds between auto-refreshes
+    REFRESH_INTERVAL = 30.0  # seconds between auto-refreshes
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
