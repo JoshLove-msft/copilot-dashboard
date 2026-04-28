@@ -418,6 +418,52 @@ def detect_live_sessions(sessions: Iterable[Session]) -> None:
             continue
 
 
+def _quick_live_check(session: "Session") -> None:
+    """Fast targeted live-check for a single session.
+
+    Avoids the full `process_iter + open_files` sweep that
+    `detect_live_sessions` does for every process. We only inspect copilot
+    processes, and we trust the cached pid first (cheap), falling back to a
+    cmdline `--resume=<id>` scan (no open_files calls).
+    """
+    if psutil is None:
+        return
+    short = session.id[:8]
+    # 1) Fast path: re-validate the cached pid.
+    if session.pid:
+        try:
+            p = psutil.Process(session.pid)
+            cmd = " ".join((p.cmdline() or [])[:6]).lower()
+            if "copilot" in (p.name() or "").lower() or "copilot" in cmd:
+                session.running = True
+                return
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        session.running = False
+        session.pid = None
+    # 2) Cheap secondary scan: cmdline `--resume=<id>` only (no open_files).
+    for proc in psutil.process_iter(["name", "cmdline", "pid"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmdline = proc.info.get("cmdline") or []
+            joined_head = " ".join(cmdline[:6]).lower()
+            if "copilot" not in name and "copilot" not in joined_head:
+                continue
+            for arg in cmdline:
+                if not arg:
+                    continue
+                low = arg.lower()
+                if "resume" not in low and "connect" not in low:
+                    continue
+                token = arg.split("=", 1)[-1].strip().strip('"').strip("'")
+                if token == session.id or (len(token) >= 7 and token == short):
+                    session.running = True
+                    session.pid = proc.info["pid"]
+                    return
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
 def humanize_age(dt: datetime | None) -> str:
     if dt is None:
         return "?"
@@ -601,19 +647,27 @@ def _has_known_window(session: "Session") -> str | None:
         return None
 
 
-def _focus_wt_tab(titles: list[str]) -> str | None:
+def _focus_wt_tab(titles: list[str]) -> tuple[str | None, list[str]]:
     """Find a WT tab whose name matches any of `titles` (in priority order)
-    and select it. Returns the matched title, or None."""
+    and select it.
+
+    Returns (matched_title_or_None, all_seen_tab_names) — the seen list is
+    useful for diagnostics when no match is found.
+    """
     if sys.platform != "win32" or not titles:
-        return None
+        return None, []
     try:
         import uiautomation as auto  # type: ignore
     except ImportError:
-        return None
+        return None, []
 
-    wanted = [t for t in titles if t]
-    if not wanted:
-        return None
+    def _norm(s: str) -> str:
+        return " ".join((s or "").strip().lower().split())
+
+    wanted_raw = [t for t in titles if t]
+    wanted = [_norm(t) for t in wanted_raw]
+    if not any(wanted):
+        return None, []
 
     try:
         desktop = auto.GetRootControl()
@@ -622,21 +676,28 @@ def _focus_wt_tab(titles: list[str]) -> str | None:
             if (c.ClassName or "").upper().startswith("CASCADIA")
         ]
     except Exception:
-        return None
+        return None, []
 
-    # Collect all tabs across all WT windows once.
+    # Collect all tabs across all WT windows, but bail per-subtree as soon as
+    # we've descended past the depth where WT puts the tab strip (~3-4).
     all_tabs: list[tuple[object, str, object]] = []  # (wt_window, tab_name, tab_ctrl)
 
     def collect(node, wt, depth: int = 0):
-        if depth > 6:
+        if depth > 5:
             return
         try:
             for child in node.GetChildren():
                 try:
-                    if child.ControlTypeName == "TabItemControl":
-                        all_tabs.append((wt, child.Name or "", child))
+                    ct = child.ControlTypeName
                 except Exception:
-                    pass
+                    ct = ""
+                if ct == "TabItemControl":
+                    try:
+                        all_tabs.append((wt, child.Name or "", child))
+                    except Exception:
+                        pass
+                    # TabItems don't contain other TabItems; skip recursion.
+                    continue
                 collect(child, wt, depth + 1)
         except Exception:
             return
@@ -644,22 +705,35 @@ def _focus_wt_tab(titles: list[str]) -> str | None:
     for wt in wt_windows:
         collect(wt, wt)
 
+    seen_names = [n for _, n, _ in all_tabs]
     if not all_tabs:
-        return None
+        return None, seen_names
 
+    norm_tabs = [(_norm(n), wt, n, ctrl) for wt, n, ctrl in all_tabs]
+
+    # Pass 1: exact (normalized) match.
     for want in wanted:
-        for wt, name, tab in all_tabs:
-            if name == want:
-                _select_tab(tab, wt)
-                return want
-    # Fallback: substring match (handles e.g. tab name "X — extra")
+        if not want:
+            continue
+        for nname, wt, raw, ctrl in norm_tabs:
+            if nname == want:
+                _select_tab(ctrl, wt)
+                return raw, seen_names
+
+    # Pass 2: substring match in either direction (handles "X — extra"
+    # suffixes added by terminals/profiles, or summaries that were truncated
+    # in workspace.yaml relative to the OSC title set by the running CLI).
     for want in wanted:
-        wl = want.lower()
-        for wt, name, tab in all_tabs:
-            if wl and wl in name.lower():
-                _select_tab(tab, wt)
-                return name
-    return None
+        if not want or len(want) < 4:
+            continue
+        for nname, wt, raw, ctrl in norm_tabs:
+            if not nname:
+                continue
+            if want in nname or nname in want:
+                _select_tab(ctrl, wt)
+                return raw, seen_names
+
+    return None, seen_names
 
 
 def _select_tab(tab, wt) -> None:
@@ -822,7 +896,7 @@ def focus_session(session: "Session") -> tuple[bool, str]:
     Then select it and bring its WT window forward.
     """
     candidates = [session.summary, f"copilot:{session.short_id}", session.short_id]
-    matched = _focus_wt_tab(candidates)
+    matched, seen = _focus_wt_tab(candidates)
     if matched:
         return True, f"→ focused tab '{matched[:60]}'"
 
@@ -830,7 +904,18 @@ def focus_session(session: "Session") -> tuple[bool, str]:
     hwnd = _find_session_hwnd(session)
     if hwnd is not None and _focus_hwnd(hwnd):
         return True, f"→ focused existing window for {session.short_id}"
-    return False, "no existing tab found"
+
+    if seen:
+        # Show the tabs we did see so the user can tell whether the dashboard
+        # is even looking at the right summary, vs. the tab really not being
+        # open.
+        preview = ", ".join(f"'{t[:30]}'" for t in seen[:6])
+        more = f" (+{len(seen)-6} more)" if len(seen) > 6 else ""
+        want = (session.summary or session.short_id or "")[:40]
+        return False, (
+            f"no tab matching '{want}'; {len(seen)} WT tab(s): {preview}{more}"
+        )
+    return False, "no Windows Terminal tabs found"
 
 
 class SettingsScreen(ModalScreen[dict | None]):
@@ -1420,8 +1505,11 @@ class DashboardApp(App):
             status.update(f"[yellow]⏳ launching {label}…[/yellow]")
 
         def _do_jump() -> tuple[bool, str]:
-            # Refresh live status so a tab opened seconds ago is found.
-            detect_live_sessions([sess])
+            # Fast targeted live-check (re-validates cached pid + cheap
+            # cmdline scan). Avoids the full process_iter + open_files sweep
+            # that detect_live_sessions does — that's the main source of the
+            # multi-second delay when clicking a row.
+            _quick_live_check(sess)
             ok, msg = focus_session(sess)
             if ok:
                 return ok, msg
