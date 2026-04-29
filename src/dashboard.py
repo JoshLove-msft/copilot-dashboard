@@ -787,6 +787,179 @@ def _select_tab(tab, wt) -> None:
         pass
 
 
+def _focus_wt_tab_by_pid(session_id: str, session_pid: int | None) -> tuple[bool, str]:
+    """Focus a WT tab by walking the session's process tree.
+
+    This is title-independent — it works even when the CLI keeps rewriting
+    the OSC tab title (e.g. while the agent is in 'working' mode).
+
+    Strategy:
+      1. Take session.pid (the running copilot process), walk its parents
+         until we find a pwsh whose ppid is a WindowsTerminal.exe pid. As a
+         backup, search psutil for any pwsh child of WT whose cmdline
+         contains `--resume=<session_id>`.
+      2. Find the WT UIA window whose ProcessId matches that WT pid.
+      3. Sort that WT window's child pwsh processes by create_time. WT
+         appends new tabs at the end of the strip, so this index typically
+         matches the visual tab order.
+      4. Sort the window's TabItem controls by their bounding-rect X
+         coordinate (visual left-to-right) and select the one at the same
+         index.
+
+    Returns (ok, msg).
+    """
+    if sys.platform != "win32":
+        return False, "non-windows"
+    if psutil is None:
+        return False, "psutil unavailable"
+
+    short = session_id[:8] if session_id else ""
+
+    # 1) Find our session's pwsh process (direct child of WT).
+    target_shell = None
+    if session_pid:
+        try:
+            cur = psutil.Process(session_pid)
+            for _ in range(8):
+                par = cur.parent()
+                if par is None:
+                    break
+                try:
+                    pname = (par.name() or "").lower()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    break
+                if pname.startswith("pwsh") or pname.startswith("powershell"):
+                    # Is its parent WT?
+                    try:
+                        gp = par.parent()
+                        if gp and (gp.name() or "").lower().startswith("windowsterminal"):
+                            target_shell = par
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                cur = par
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    if target_shell is None and session_id:
+        # Fallback: scan WT's child shells for our --resume token.
+        for proc in psutil.process_iter(["name", "cmdline", "ppid", "pid"]):
+            try:
+                pname = (proc.info.get("name") or "").lower()
+                if not (pname.startswith("pwsh") or pname.startswith("powershell")):
+                    continue
+                par = proc.parent()
+                if par is None or not (par.name() or "").lower().startswith("windowsterminal"):
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                joined = " ".join(cmdline).lower()
+                if session_id.lower() in joined or (short and short.lower() in joined and "resume" in joined):
+                    target_shell = proc
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    if target_shell is None:
+        return False, "no WT-hosted shell for this session"
+
+    try:
+        wt_pid = target_shell.parent().pid
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False, "WT parent gone"
+
+    # 2) Enumerate WT's child shells and find ours by index.
+    siblings = []
+    try:
+        wt_proc = psutil.Process(wt_pid)
+        for ch in wt_proc.children(recursive=False):
+            try:
+                cn = (ch.name() or "").lower()
+                if cn.startswith("pwsh") or cn.startswith("powershell") or cn.startswith("cmd"):
+                    siblings.append((ch.create_time(), ch.pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False, "WT process gone"
+
+    siblings.sort()
+    sibling_pids = [pid for _, pid in siblings]
+    if target_shell.pid not in sibling_pids:
+        return False, "shell not a direct WT child"
+    tab_index = sibling_pids.index(target_shell.pid)
+
+    # 3) Find the WT UIA window with that pid and select its tab[tab_index].
+    try:
+        import uiautomation as auto  # type: ignore
+    except ImportError:
+        return False, "uiautomation unavailable"
+    try:
+        desktop = auto.GetRootControl()
+        wt_window = None
+        for c in desktop.GetChildren():
+            try:
+                if (c.ClassName or "").upper().startswith("CASCADIA") and c.ProcessId == wt_pid:
+                    wt_window = c
+                    break
+            except Exception:
+                continue
+        if wt_window is None:
+            return False, "WT UIA window not found"
+
+        tabs: list = []
+        def _walk(node, d=0):
+            if d > 5:
+                return
+            try:
+                for ch in node.GetChildren():
+                    try:
+                        if ch.ControlTypeName == "TabItemControl":
+                            tabs.append(ch)
+                            continue
+                    except Exception:
+                        pass
+                    _walk(ch, d + 1)
+            except Exception:
+                return
+        _walk(wt_window)
+
+        if not tabs:
+            return False, "WT window has no tabs"
+
+        # Order tabs left-to-right by bounding rectangle, falling back to
+        # discovery order.
+        def _xkey(t):
+            try:
+                r = t.BoundingRectangle
+                return (r.left, r.top)
+            except Exception:
+                return (0, 0)
+        tabs_sorted = sorted(tabs, key=_xkey)
+
+        if tab_index >= len(tabs_sorted):
+            # Tabs and shells out of sync (e.g. user reordered). Just focus
+            # the WT window so the user can see it.
+            try:
+                hwnd = wt_window.NativeWindowHandle
+                if hwnd:
+                    _focus_hwnd(hwnd)
+            except Exception:
+                pass
+            return False, (
+                f"shell index {tab_index} out of range ({len(tabs_sorted)} tabs); "
+                "focused window only"
+            )
+
+        tab = tabs_sorted[tab_index]
+        _select_tab(tab, wt_window)
+        try:
+            name = tab.Name or ""
+        except Exception:
+            name = ""
+        return True, f"→ focused tab #{tab_index + 1} ({name[:40] or 'untitled'})"
+    except Exception as exc:
+        return False, f"UIA error: {exc}"
+
+
 def _spawn_wt(argv: list[str], cwd: str | None) -> tuple[bool, str]:
     """Spawn a wt.exe command, fully detached, and capture stderr on failure.
 
@@ -921,12 +1094,20 @@ def launch_session_tab(session: "Session", cfg: dict | None = None) -> tuple[boo
 def focus_session(session: "Session") -> tuple[bool, str]:
     """Surface an already-open session.
 
-    Strategy: use UI Automation to find a WT tab whose name matches one of:
-      1. session.summary  (copilot CLI sets WT tab title to the summary)
-      2. f"copilot:{short_id}"  (our explicit --title for fresh launches)
-      3. session.short_id
-    Then select it and bring its WT window forward.
+    Strategy:
+      0. If we know the session's running pid, walk its process tree to find
+         the hosting WT window + tab index. This is title-independent and
+         works even while the CLI is rewriting the OSC tab title (e.g. in
+         'working' mode).
+      1. Otherwise, use UI Automation to find a WT tab whose name matches
+         a candidate (summary, copilot:short_id, short_id).
     """
+    # Process-tree path (most reliable for live sessions).
+    if session.pid or session.running:
+        ok, msg = _focus_wt_tab_by_pid(session.id, session.pid)
+        if ok:
+            return True, msg
+
     candidates = [session.summary, f"copilot:{session.short_id}", session.short_id]
     matched, seen = _focus_wt_tab(candidates)
     if matched:
@@ -938,9 +1119,6 @@ def focus_session(session: "Session") -> tuple[bool, str]:
         return True, f"→ focused existing window for {session.short_id}"
 
     if seen:
-        # Show the tabs we did see so the user can tell whether the dashboard
-        # is even looking at the right summary, vs. the tab really not being
-        # open.
         preview = ", ".join(f"'{t[:30]}'" for t in seen[:6])
         more = f" (+{len(seen)-6} more)" if len(seen) > 6 else ""
         want = (session.summary or session.short_id or "")[:40]
