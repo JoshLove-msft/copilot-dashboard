@@ -664,8 +664,25 @@ def _focus_wt_tab(titles: list[str]) -> tuple[str | None, list[str]]:
     def _norm(s: str) -> str:
         return " ".join((s or "").strip().lower().split())
 
+    def _alnum(s: str) -> str:
+        # Keep only [a-z0-9] runs separated by single spaces. Strips spinner
+        # glyphs, bullets, parentheses, em-dashes, status markers like
+        # '(working)', '●', '⠋', etc. that copilot prefixes when active.
+        out: list[str] = []
+        run: list[str] = []
+        for ch in (s or "").lower():
+            if ch.isalnum():
+                run.append(ch)
+            elif run:
+                out.append("".join(run))
+                run = []
+        if run:
+            out.append("".join(run))
+        return " ".join(out)
+
     wanted_raw = [t for t in titles if t]
     wanted = [_norm(t) for t in wanted_raw]
+    wanted_alnum = [_alnum(t) for t in wanted_raw]
     if not any(wanted):
         return None, []
 
@@ -709,13 +726,13 @@ def _focus_wt_tab(titles: list[str]) -> tuple[str | None, list[str]]:
     if not all_tabs:
         return None, seen_names
 
-    norm_tabs = [(_norm(n), wt, n, ctrl) for wt, n, ctrl in all_tabs]
+    norm_tabs = [(_norm(n), _alnum(n), wt, n, ctrl) for wt, n, ctrl in all_tabs]
 
     # Pass 1: exact (normalized) match.
     for want in wanted:
         if not want:
             continue
-        for nname, wt, raw, ctrl in norm_tabs:
+        for nname, _ana, wt, raw, ctrl in norm_tabs:
             if nname == want:
                 _select_tab(ctrl, wt)
                 return raw, seen_names
@@ -726,10 +743,25 @@ def _focus_wt_tab(titles: list[str]) -> tuple[str | None, list[str]]:
     for want in wanted:
         if not want or len(want) < 4:
             continue
-        for nname, wt, raw, ctrl in norm_tabs:
+        for nname, _ana, wt, raw, ctrl in norm_tabs:
             if not nname:
                 continue
             if want in nname or nname in want:
+                _select_tab(ctrl, wt)
+                return raw, seen_names
+
+    # Pass 3: alphanumeric-only substring match. Handles spinner glyphs,
+    # bullets, "(working)" / "(waiting)" status markers, em-dashes, etc.
+    # that the CLI prefixes/decorates the OSC title with while the agent is
+    # active — the raw title may be e.g. "⠋ Add Paging Tests (working)" but
+    # the alphanumeric core is still "add paging tests working".
+    for want_a in wanted_alnum:
+        if not want_a or len(want_a) < 4:
+            continue
+        for _nn, ana, wt, raw, ctrl in norm_tabs:
+            if not ana:
+                continue
+            if want_a in ana or ana in want_a:
                 _select_tab(ctrl, wt)
                 return raw, seen_names
 
