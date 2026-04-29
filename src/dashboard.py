@@ -21,7 +21,7 @@ import subprocess
 import sys
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -106,6 +106,7 @@ class Session:
     pid: int | None = None  # pid of the running copilot process (when known)
     pr: str = ""  # PR ref like "#1234" if this session created/touched a PR
     pr_url: str = ""  # Full URL to the PR, when known
+    prs: list[tuple[int, str]] = field(default_factory=list)  # all PRs as (number, url)
     turns: int = 0  # number of user/assistant turns in this session
     agent_state: str = ""  # "working" | "waiting" | "done" | ""
 
@@ -313,8 +314,8 @@ def _attach_store_data(sessions: list[Session]) -> None:
             ev = SESSION_ROOT / sess.id / "events.jsonl"
             if ev.exists() and sess.events_mtime > 0:
                 sess.turns, sess.agent_state = _scan_events(ev, sess.events_mtime)
-        # PR refs (highest-numbered per session).
-        best: dict[str, int] = {}
+        # PR refs — collect ALL per session, not just the highest-numbered.
+        all_prs: dict[str, set[int]] = {}
         try:
             for sid, val in con.execute(
                 "SELECT session_id, ref_value FROM session_refs WHERE ref_type='pr'"
@@ -325,31 +326,47 @@ def _attach_store_data(sessions: list[Session]) -> None:
                     n = int(str(val))
                 except (TypeError, ValueError):
                     continue
-                if n > best.get(sid, -1):
-                    best[sid] = n
+                all_prs.setdefault(sid, set()).add(n)
         except sqlite3.Error:
             pass
-        for sid, n in best.items():
+        for sid, nums in all_prs.items():
             sess = by_id[sid]
-            sess.pr = f"#{n}"
+            sorted_nums = sorted(nums)
+            # Resolve canonical URL per PR via events.jsonl (one scan per file).
             ev = SESSION_ROOT / sid / "events.jsonl"
+            url_by_n: dict[int, str] = {}
             if ev.exists():
                 pat = re.compile(
-                    rf"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/{n}\b"
+                    r"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/(\d+)\b"
                 )
                 try:
                     with ev.open("r", encoding="utf-8", errors="replace") as f:
                         for line in f:
                             if "/pull/" not in line:
                                 continue
-                            m = pat.search(line)
-                            if m:
-                                sess.pr_url = m.group(0)
+                            for m in pat.finditer(line):
+                                try:
+                                    pn = int(m.group(3))
+                                except ValueError:
+                                    continue
+                                if pn in nums and pn not in url_by_n:
+                                    url_by_n[pn] = m.group(0)
+                            if len(url_by_n) >= len(nums):
                                 break
                 except OSError:
                     pass
-            if not sess.pr_url and sess.repository:
-                sess.pr_url = f"https://github.com/{sess.repository}/pull/{n}"
+            sess.prs = []
+            for n in sorted_nums:
+                url = url_by_n.get(n) or (
+                    f"https://github.com/{sess.repository}/pull/{n}"
+                    if sess.repository else ""
+                )
+                sess.prs.append((n, url))
+            # Maintain back-compat single-PR fields (highest-numbered).
+            if sess.prs:
+                top_n, top_url = sess.prs[-1]
+                sess.pr = f"#{top_n}"
+                sess.pr_url = top_url
     finally:
         con.close()
 
@@ -1427,7 +1444,8 @@ class DashboardApp(App):
                 hidden_empty += 1
                 continue
             if needle:
-                hay = " ".join((s.id, s.cwd, s.repository, s.branch, s.summary, s.pr)).lower()
+                pr_str = " ".join(f"#{n}" for n, _ in (s.prs or [])) or s.pr
+                hay = " ".join((s.id, s.cwd, s.repository, s.branch, s.summary, pr_str)).lower()
                 if needle not in hay:
                     continue
             visible.append(s)
@@ -1459,7 +1477,26 @@ class DashboardApp(App):
             if s.branch:
                 repo_branch = f"{repo_branch} ({s.branch})" if s.repository else s.branch
             pr_cell: object = ""
-            if s.pr:
+            if s.prs:
+                # Build a multi-line clickable Text with one PR per line.
+                pr_text = Text()
+                for i, (n, url) in enumerate(s.prs):
+                    if i:
+                        pr_text.append("\n")
+                    label = f"#{n}"
+                    if url:
+                        pr_text.append(
+                            label,
+                            style=Style(
+                                color="cyan",
+                                underline=True,
+                                meta={"@click": f"open_pr({url!r})"},
+                            ),
+                        )
+                    else:
+                        pr_text.append(label)
+                pr_cell = pr_text
+            elif s.pr:
                 if s.pr_url:
                     pr_cell = Text(
                         s.pr,
@@ -1471,6 +1508,7 @@ class DashboardApp(App):
                     )
                 else:
                     pr_cell = s.pr
+            row_height = max(1, len(s.prs)) if s.prs else 1
             table.add_row(
                 truncate(s.summary or "—", 50),
                 s.status,
@@ -1481,6 +1519,7 @@ class DashboardApp(App):
                 s.short_id,
                 truncate(repo_branch, 50),
                 truncate(s.cwd or "—", 50),
+                height=row_height,
             )
             self.row_keys.append(s.id)
         status = self.query_one("#status", Static)
@@ -1761,11 +1800,20 @@ class DashboardApp(App):
         if col_idx == self.PR_COL:
             sid = self.row_keys[row_idx]
             sess = next((s for s in self.sessions if s.id == sid), None)
-            if sess and sess.pr_url:
-                import webbrowser
-                webbrowser.open(sess.pr_url)
-                self.query_one("#status", Static).update(f"→ opened {sess.pr_url}")
-                return
+            if sess:
+                urls = [u for _, u in (sess.prs or []) if u]
+                if not urls and sess.pr_url:
+                    urls = [sess.pr_url]
+                if urls:
+                    import webbrowser
+                    for u in urls:
+                        webbrowser.open(u)
+                    if len(urls) == 1:
+                        msg = f"→ opened {urls[0]}"
+                    else:
+                        msg = f"→ opened {len(urls)} PRs"
+                    self.query_one("#status", Static).update(msg)
+                    return
         self._jump_row(row_idx)
 
     def _toggle_collapse(self, repo: str, force: bool | None = None) -> None:
