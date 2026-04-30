@@ -22,26 +22,36 @@ Write-Host 'starting…' -ForegroundColor DarkGray
 $skip = $NoUpdate -or ($env:COPILOT_DASH_NO_UPDATE -eq '1')
 if (-not $skip) {
     Write-Host '  • checking for updates…' -NoNewline -ForegroundColor DarkGray
-    $base       = 'https://raw.githubusercontent.com/JoshLove-msft/copilot-dashboard/main'
-    $srcBase    = "$base/src"
+    $owner      = 'JoshLove-msft'
+    $repo       = 'copilot-dashboard'
+    $apiBase    = "https://api.github.com/repos/$owner/$repo"
     $files      = @('dashboard.py', 'copilot-dash.ps1', 'requirements.txt', '_new-session-launcher.ps1')
     $reqBefore  = if (Test-Path (Join-Path $root 'requirements.txt')) {
         Get-FileHash (Join-Path $root 'requirements.txt') -Algorithm SHA256
     } else { $null }
     try {
+        # Resolve main → commit SHA via the API (this endpoint is not behind
+        # the raw CDN and is up-to-date within seconds of a push). Then fetch
+        # each file pinned to that immutable SHA so we never get a stale CDN
+        # response for `main`.
+        $headers = @{
+            'Cache-Control' = 'no-cache'
+            'Pragma'        = 'no-cache'
+            'User-Agent'    = 'copilot-dashboard-launcher'
+            'Accept'        = 'application/vnd.github+json'
+        }
+        $shaResp = Invoke-RestMethod -Uri "$apiBase/commits/main" -Headers $headers -TimeoutSec 8
+        $sha     = $shaResp.sha
+        $rawBase = "https://raw.githubusercontent.com/$owner/$repo/$sha/src"
         foreach ($f in $files) {
             $dest = Join-Path $root $f
             $tmp  = "$dest.new"
-            # Cache-buster + no-cache header: raw.githubusercontent.com is fronted
-            # by a CDN that can serve stale content for several minutes after a
-            # push. The ?t=<ticks> query string + header forces a fresh fetch.
-            $bust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
             Invoke-WebRequest -UseBasicParsing -TimeoutSec 8 `
-                -Headers @{ 'Cache-Control' = 'no-cache'; 'Pragma' = 'no-cache' } `
-                -Uri "$srcBase/$f`?t=$bust" -OutFile $tmp
+                -Headers $headers `
+                -Uri "$rawBase/$f" -OutFile $tmp
             Move-Item -Force $tmp $dest
         }
-        Write-Host ' done' -ForegroundColor Green
+        Write-Host " done ($($sha.Substring(0,7)))" -ForegroundColor Green
     } catch {
         Write-Host " skipped ($($_.Exception.Message))" -ForegroundColor DarkGray
     }
