@@ -77,5 +77,10 @@ if (-not (Test-Path $marker)) {
 }
 
 Write-Host '  • launching dashboard…' -ForegroundColor DarkGray
-python (Join-Path $root 'dashboard.py')
+# -B disables writing/reading the __pycache__ .pyc files. We update
+# dashboard.py in place from GitHub on every launch, and a stale .pyc
+# whose embedded source mtime happens to mis-match can cause Python to
+# either run old bytecode or crash with a confusing traceback. Skipping
+# bytecode entirely costs ~50ms and removes that whole failure mode.
+python -B (Join-Path $root 'dashboard.py')
 exit $LASTEXITCODE
