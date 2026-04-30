@@ -1345,7 +1345,7 @@ class DashboardApp(App):
         if self._refresh_in_flight:
             self._debug("auto_refresh skipped: previous still running")
             return
-        self.run_worker(self._auto_refresh(), exclusive=False)
+        self.run_worker(self._auto_refresh, exclusive=False)
 
     def _schedule_tick(self) -> None:
         try:
@@ -1372,7 +1372,7 @@ class DashboardApp(App):
             )
             if stale:
                 self._debug("watchdog: forcing auto refresh")
-                self.run_worker(self._auto_refresh(), exclusive=False)
+                self.run_worker(self._auto_refresh, exclusive=False)
         except Exception:
             pass
 
@@ -1448,12 +1448,12 @@ class DashboardApp(App):
         finally:
             self._refresh_in_flight = False
 
-    def action_refresh(self) -> None:
+    async def action_refresh(self) -> None:
         # Offload to a worker so the manual refresh doesn't block the event
         # loop (and freeze the countdown ticker).
         if self._refresh_in_flight:
             return
-        self.run_worker(self._auto_refresh(), exclusive=False)
+        await self._auto_refresh()
 
     def _populate(self) -> None:
         table = self.query_one(DataTable)
