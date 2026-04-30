@@ -1345,7 +1345,7 @@ class DashboardApp(App):
         if self._refresh_in_flight:
             self._debug("auto_refresh skipped: previous still running")
             return
-        self.run_worker(self._auto_refresh, exclusive=False)
+        self.run_worker(self._do_auto_refresh, exclusive=False)
 
     def _schedule_tick(self) -> None:
         try:
@@ -1372,7 +1372,7 @@ class DashboardApp(App):
             )
             if stale:
                 self._debug("watchdog: forcing auto refresh")
-                self.run_worker(self._auto_refresh, exclusive=False)
+                self.run_worker(self._do_auto_refresh, exclusive=False)
         except Exception:
             pass
 
@@ -1402,7 +1402,7 @@ class DashboardApp(App):
         self._refresh_count += 1
         self._populate()
 
-    async def _auto_refresh(self) -> None:
+    async def _do_auto_refresh(self) -> None:
         # Run heavy I/O off the asyncio thread so the loop (and the 1s
         # countdown ticker) keep firing during refresh.
         self._refresh_in_flight = True
@@ -1453,7 +1453,7 @@ class DashboardApp(App):
         # loop (and freeze the countdown ticker).
         if self._refresh_in_flight:
             return
-        await self._auto_refresh()
+        await self._do_auto_refresh()
 
     def _populate(self) -> None:
         table = self.query_one(DataTable)
