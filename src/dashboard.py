@@ -1311,6 +1311,8 @@ class DashboardApp(App):
         self.col_keys = list(table.add_columns(*self._base_labels))
         self.last_refresh: float = 0.0
         self._refresh_count: int = 0
+        self._refresh_in_flight: bool = False
+        self._last_tick: float = time.time()
         # Show an immediate "loading" hint so the first paint isn't a blank
         # screen — the actual session scan + psutil sweep can take several
         # seconds on a busy machine. Run it in a worker so the UI mounts
@@ -1320,11 +1322,68 @@ class DashboardApp(App):
         )
         self.set_focus(table)
         self.run_worker(self._initial_load(), exclusive=False)
-        # Auto-refresh on a fixed interval; preserves cursor position.
-        self._auto_timer = self.set_interval(self.REFRESH_INTERVAL, self._auto_refresh)
-        # 1-second countdown ticker so the user can see when the next
-        # refresh will fire.
-        self.set_interval(1.0, self._tick_countdown)
+        # Auto-refresh ticker: re-armed each pass via call_later so that a
+        # slow / overlapping refresh can never starve the next tick the way
+        # set_interval does (set_interval awaits the previous async callback
+        # before scheduling the next one).
+        self._schedule_auto_refresh()
+        # 1-second countdown ticker. Use call_later self-rescheduling rather
+        # than set_interval so that a transient exception in the callback
+        # cannot stop the timer permanently.
+        self._schedule_tick()
+
+    def _schedule_auto_refresh(self) -> None:
+        try:
+            self.set_timer(self.REFRESH_INTERVAL, self._auto_refresh_kick)
+        except Exception:
+            pass
+
+    def _auto_refresh_kick(self) -> None:
+        # Re-arm immediately so the next refresh happens REFRESH_INTERVAL
+        # seconds from now regardless of how long this one takes.
+        self._schedule_auto_refresh()
+        if self._refresh_in_flight:
+            self._debug("auto_refresh skipped: previous still running")
+            return
+        self.run_worker(self._auto_refresh(), exclusive=False)
+
+    def _schedule_tick(self) -> None:
+        try:
+            self.set_timer(1.0, self._tick_kick)
+        except Exception:
+            pass
+
+    def _tick_kick(self) -> None:
+        # Always re-arm first, even if the body raises, so the timer cannot
+        # die on us.
+        self._schedule_tick()
+        try:
+            self._last_tick = time.time()
+            self._refresh_status_line()
+        except Exception as exc:
+            self._debug(f"tick error: {exc}")
+        # Watchdog: if auto_refresh somehow hasn't run in 2x the interval,
+        # kick it.
+        try:
+            stale = (
+                self.last_refresh
+                and (time.time() - self.last_refresh) > (self.REFRESH_INTERVAL * 2)
+                and not self._refresh_in_flight
+            )
+            if stale:
+                self._debug("watchdog: forcing auto refresh")
+                self.run_worker(self._auto_refresh(), exclusive=False)
+        except Exception:
+            pass
+
+    def _debug(self, msg: str) -> None:
+        try:
+            log_path = Path.home() / ".copilot-dashboard" / "debug.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
 
     async def _initial_load(self) -> None:
         try:
@@ -1346,6 +1405,7 @@ class DashboardApp(App):
     async def _auto_refresh(self) -> None:
         # Run heavy I/O off the asyncio thread so the loop (and the 1s
         # countdown ticker) keep firing during refresh.
+        self._refresh_in_flight = True
         try:
             try:
                 table = self.query_one(DataTable)
@@ -1363,6 +1423,7 @@ class DashboardApp(App):
                     )
                 except Exception:
                     pass
+                self._debug(f"auto_refresh load error: {exc}")
                 return
             self.sessions = sessions
             self.last_refresh = time.time()
@@ -1383,13 +1444,16 @@ class DashboardApp(App):
                 )
             except Exception:
                 pass
+            self._debug(f"auto_refresh outer error: {exc}")
+        finally:
+            self._refresh_in_flight = False
 
     def action_refresh(self) -> None:
-        self.sessions = load_sessions()
-        detect_live_sessions(self.sessions)
-        self.last_refresh = time.time()
-        self._refresh_count += 1
-        self._populate()
+        # Offload to a worker so the manual refresh doesn't block the event
+        # loop (and freeze the countdown ticker).
+        if self._refresh_in_flight:
+            return
+        self.run_worker(self._auto_refresh(), exclusive=False)
 
     def _populate(self) -> None:
         table = self.query_one(DataTable)
@@ -1683,12 +1747,10 @@ class DashboardApp(App):
             new_interval = max(2.0, float(self.config.get("refresh_interval", 30)))
             if new_interval != self.REFRESH_INTERVAL:
                 self.REFRESH_INTERVAL = new_interval
-                try:
-                    if getattr(self, "_auto_timer", None):
-                        self._auto_timer.stop()
-                except Exception:
-                    pass
-                self._auto_timer = self.set_interval(self.REFRESH_INTERVAL, self._auto_refresh)
+                # Next auto-refresh tick will pick up the new interval. We
+                # don't need to stop a timer because _schedule_auto_refresh
+                # uses self-rescheduling set_timer calls.
+                self._schedule_auto_refresh()
                 # Reset countdown anchor.
                 self.last_refresh = time.time()
             self._populate()
