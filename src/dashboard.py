@@ -1838,24 +1838,37 @@ class DashboardApp(App):
         sess = next((s for s in self.sessions if s.id == sid), None)
         if sess is None:
             return
+        # Render the preview off the UI thread — events.jsonl reads + JSON
+        # parsing for a long-running session can take 100+ms and would
+        # otherwise freeze the dashboard during fast cursor navigation.
+        self.run_worker(
+            self._render_preview_worker(sess.id, sess.short_id, sess.summary or "", sess.cwd or ""),
+            exclusive=True,
+            group="preview",
+        )
+
+    async def _render_preview_worker(self, sid: str, short_id: str, summary: str, cwd: str) -> None:
+        try:
+            body = await asyncio.to_thread(_render_session_preview, sid, 25)
+        except Exception as exc:
+            body = Text(f"(preview error: {exc})", style="red")
+        # If the user moved on to a different row while we were reading,
+        # don't clobber the newer render.
+        if sid != self._last_preview_sid:
+            return
         try:
             preview = self.query_one("#preview", RichLog)
         except Exception:
             return
         preview.clear()
         head = Text()
-        head.append(f"{sess.short_id} ", style="bold")
-        if sess.summary:
-            head.append(sess.summary[:80], style="bold cyan")
+        head.append(f"{short_id} ", style="bold")
+        if summary:
+            head.append(summary[:80], style="bold cyan")
         head.append("\n")
-        if sess.cwd:
-            head.append(f"  cwd: {sess.cwd}\n", style="dim")
+        if cwd:
+            head.append(f"  cwd: {cwd}\n", style="dim")
         preview.write(head)
-        try:
-            body = _render_session_preview(sess.id, max_events=25)
-        except Exception as exc:
-            preview.write(Text(f"(preview error: {exc})", style="red"))
-            return
         preview.write(body)
 
     def action_open_pr(self, url: str) -> None:
