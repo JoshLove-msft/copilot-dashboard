@@ -1225,30 +1225,33 @@ def focus_session(session: "Session") -> tuple[bool, str]:
     """Surface an already-open session.
 
     Strategy:
-      0. If we know the session's running pid, walk its process tree to find
-         the hosting WT window + tab index. This is title-independent and
-         works even while the CLI is rewriting the OSC tab title (e.g. in
-         'working' mode).
-      1. Otherwise, use UI Automation to find a WT tab whose name matches
-         a candidate (summary, copilot:short_id, short_id).
+      1. Title match via UIA: scan WT tabs for one whose name matches
+         summary / copilot:short_id / short_id. This is the most reliable
+         path when titles are intact (the common case).
+      2. Process-tree pid mapping: walk session.pid → its parent pwsh →
+         its parent WT, then map the shell to a tab. Used as a fallback
+         for when the tab title has been rewritten by the agent.
+      3. Win32 fallback for non-WT consoles.
     """
     _file_debug(
         f"focus_session sid={session.id[:8]} short={session.short_id} "
         f"pid={session.pid} running={session.running} "
         f"summary={(session.summary or '')[:50]!r}"
     )
-    # Process-tree path (most reliable for live sessions).
+
+    candidates = [c for c in (session.summary, f"copilot:{session.short_id}", session.short_id) if c]
+    matched, seen = _focus_wt_tab(candidates)
+    _file_debug(f"  by_title candidates={candidates!r} matched={matched!r}")
+    if matched:
+        return True, f"→ focused tab '{matched[:60]}'"
+
+    # Title didn't match (possibly because the agent rewrote the OSC title
+    # during 'working' mode) — fall back to the process-tree path.
     if session.pid or session.running:
         ok, msg = _focus_wt_tab_by_pid(session.id, session.pid)
         _file_debug(f"  by_pid → ok={ok} msg={msg!r}")
         if ok:
             return True, msg
-
-    candidates = [session.summary, f"copilot:{session.short_id}", session.short_id]
-    matched, seen = _focus_wt_tab(candidates)
-    _file_debug(f"  by_title candidates={candidates!r} matched={matched!r}")
-    if matched:
-        return True, f"→ focused tab '{matched[:60]}'"
 
     # Win32 fallback for non-WT consoles.
     hwnd = _find_session_hwnd(session)
