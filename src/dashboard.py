@@ -39,7 +39,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static, Switch
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static, Switch
 
 
 SESSION_ROOT = Path(os.environ.get("COPILOT_CONFIG_DIR", Path.home() / ".copilot")) / "session-state"
@@ -504,6 +504,108 @@ def truncate(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[: n - 1] + "…"
+
+
+def _summarize_tool_args(tool: str, args) -> str:
+    if not isinstance(args, dict):
+        return ""
+    # Pick the most useful field per common tool, falling back to a generic
+    # short JSON-ish representation.
+    candidates = (
+        "command", "description", "path", "file_path", "url", "pattern",
+        "query", "prompt", "message", "intent",
+    )
+    for key in candidates:
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return truncate(v.strip().replace("\n", " "), 140)
+    # Fallback: first short string-valued field.
+    for k, v in args.items():
+        if isinstance(v, str) and v.strip():
+            return f"{k}={truncate(v.strip(), 100)}"
+    return ""
+
+
+def _render_session_preview(session_id: str, max_events: int = 25) -> "Text":
+    """Return a Rich Text summary of recent events.jsonl entries for a session.
+
+    Reads only the tail of the file (last ~256KB) so this is cheap even on
+    long-lived sessions. Returns a friendly "no events" placeholder rather
+    than raising when the file is missing/short.
+    """
+    sess_dir = SESSION_ROOT / session_id
+    events_file = sess_dir / "events.jsonl"
+    if not events_file.exists():
+        return Text("(no events recorded yet)", style="dim")
+    try:
+        with events_file.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            seek_to = max(0, size - 256 * 1024)
+            f.seek(seek_to)
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return Text(f"(error reading events.jsonl: {exc})", style="red")
+    raw_lines = tail.split("\n")
+    # If we seeked into the middle of the file, the first line is likely
+    # partial — drop it.
+    if seek_to > 0 and raw_lines:
+        raw_lines = raw_lines[1:]
+    events = []
+    for ln in raw_lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            events.append(json.loads(ln))
+        except Exception:
+            continue
+    # Filter to the types we render and take the tail.
+    keep = {
+        "user.message", "assistant.message",
+        "tool.execution_start", "tool.execution_complete",
+    }
+    filtered = [ev for ev in events if ev.get("type") in keep]
+    filtered = filtered[-max_events:]
+    out = Text()
+    if not filtered:
+        out.append("(no recent activity)\n", style="dim")
+        return out
+    for ev in filtered:
+        t = ev.get("type", "")
+        d = ev.get("data") or {}
+        if t == "user.message":
+            txt = (d.get("content") or "").strip().replace("\n", " ")
+            out.append("user      ", style="bold cyan")
+            out.append(truncate(txt, 200) + "\n")
+        elif t == "assistant.message":
+            txt = (d.get("content") or "").strip().replace("\n", " ")
+            out.append("assistant ", style="bold green")
+            out.append(truncate(txt, 200) + "\n")
+        elif t == "tool.execution_start":
+            tool = d.get("toolName") or d.get("tool_name") or "?"
+            arg_str = _summarize_tool_args(tool, d.get("arguments") or d.get("args"))
+            out.append(f"  → {tool} ", style="bold yellow")
+            if arg_str:
+                out.append(arg_str + "\n", style="dim")
+            else:
+                out.append("\n")
+        elif t == "tool.execution_complete":
+            tool = d.get("toolName") or d.get("tool_name") or "?"
+            success = d.get("success")
+            if success is False:
+                err = ""
+                res = d.get("result") or {}
+                if isinstance(res, dict):
+                    err = (res.get("error") or "").strip().replace("\n", " ")
+                out.append(f"  ✗ {tool} ", style="bold red")
+                if err:
+                    out.append(truncate(err, 160) + "\n", style="dim")
+                else:
+                    out.append("\n")
+            else:
+                out.append(f"  ✓ {tool}\n", style="green")
+    return out
 
 
 _AGENT_LABELS = {
@@ -1255,6 +1357,8 @@ class DashboardApp(App):
     #search { dock: top; height: 3; display: none; }
     #search.visible { display: block; }
     #status { dock: bottom; height: 1; color: $text-muted; padding: 0 1; }
+    #preview { dock: bottom; height: 14; border-top: solid $accent; padding: 0 1; display: none; }
+    #preview.visible { display: block; }
     DataTable { height: 1fr; }
     """
 
@@ -1267,6 +1371,7 @@ class DashboardApp(App):
         Binding("a", "toggle_empty", "Show empty"),
         Binding("l", "toggle_live", "Live only"),
         Binding("g", "toggle_group", "Group by repo"),
+        Binding("p", "toggle_preview", "Preview"),
         Binding("v", "open_in_vscode", "Open in VSCode"),
         Binding("s", "open_settings", "Settings"),
         Binding("q", "quit", "Quit"),
@@ -1286,11 +1391,14 @@ class DashboardApp(App):
         self._separator_repos: dict[int, str] = {}  # row index -> repo name
         self.sort_col: int | None = None  # None → default tier sort
         self.sort_desc: bool = False
+        self.show_preview: bool = bool(self.config.get("show_preview", False))
+        self._last_preview_sid: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Input(placeholder="filter… (esc to clear)", id="search")
         yield DataTable(id="table", cursor_type="cell", zebra_stripes=True)
+        yield RichLog(id="preview", wrap=True, markup=False, highlight=False, max_lines=200)
         yield Static("", id="status")
         yield Footer()
 
@@ -1321,6 +1429,7 @@ class DashboardApp(App):
             "[yellow]⏳ loading sessions…[/yellow]"
         )
         self.set_focus(table)
+        self._apply_preview_visibility()
         self.run_worker(self._initial_load(), exclusive=False)
         # Auto-refresh ticker: re-armed each pass via call_later so that a
         # slow / overlapping refresh can never starve the next tick the way
@@ -1659,6 +1768,69 @@ class DashboardApp(App):
         self.group_by_repo = not self.group_by_repo
         self._populate()
 
+    def action_toggle_preview(self) -> None:
+        self.show_preview = not self.show_preview
+        self.config["show_preview"] = self.show_preview
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+        self._apply_preview_visibility()
+        if self.show_preview:
+            # Force-refresh for the currently selected row.
+            self._last_preview_sid = ""
+            self._update_preview_for_cursor()
+
+    def _apply_preview_visibility(self) -> None:
+        try:
+            preview = self.query_one("#preview", RichLog)
+            preview.set_class(self.show_preview, "visible")
+        except Exception:
+            pass
+
+    def _selected_session_for_preview(self) -> "Session | None":
+        try:
+            table = self.query_one(DataTable)
+            row = table.cursor_row
+            if row is None or row < 0 or row >= len(self.row_keys):
+                return None
+            sid = self.row_keys[row]
+            if not sid:  # separator row
+                return None
+            return next((s for s in self.sessions if s.id == sid), None)
+        except Exception:
+            return None
+
+    def _update_preview_for_cursor(self) -> None:
+        if not self.show_preview:
+            return
+        sess = self._selected_session_for_preview()
+        if sess is None:
+            return
+        if sess.id == self._last_preview_sid:
+            return
+        self._last_preview_sid = sess.id
+        try:
+            preview = self.query_one("#preview", RichLog)
+        except Exception:
+            return
+        preview.clear()
+        # Header line
+        head = Text()
+        head.append(f"{sess.short_id} ", style="bold")
+        if sess.summary:
+            head.append(sess.summary[:80], style="bold cyan")
+        head.append("\n")
+        if sess.cwd:
+            head.append(f"  cwd: {sess.cwd}\n", style="dim")
+        preview.write(head)
+        try:
+            body = _render_session_preview(sess.id, max_events=25)
+        except Exception as exc:
+            preview.write(Text(f"(preview error: {exc})", style="red"))
+            return
+        preview.write(body)
+
     def action_open_pr(self, url: str) -> None:
         import webbrowser
         webbrowser.open(url)
@@ -1916,6 +2088,13 @@ class DashboardApp(App):
         event.stop()
         try:
             event.prevent_default()
+        except Exception:
+            pass
+
+    def on_data_table_cell_highlighted(self, event) -> None:
+        # Update the preview pane when the cursor moves to a different row.
+        try:
+            self._update_preview_for_cursor()
         except Exception:
             pass
 
