@@ -1640,7 +1640,8 @@ class DashboardApp(App):
                     marker = "▶" if is_collapsed else "▼"
                     label = Text(f"{marker} {repo}  ({group_counts[repo]})",
                                  style="bold magenta")
-                    table.add_row(label, "", "", "", "", "", "", "", "")
+                    table.add_row(label, "", "", "", "", "", "", "", "",
+                                  key=f"__sep__{repo}__{len(self.row_keys)}")
                     self._separator_repos[len(self.row_keys)] = repo
                     self.row_keys.append("")  # sentinel: separator row
                     last_repo = repo
@@ -1693,6 +1694,7 @@ class DashboardApp(App):
                 truncate(repo_branch, 50),
                 truncate(s.cwd or "—", 50),
                 height=row_height,
+                key=s.id,
             )
             self.row_keys.append(s.id)
         status = self.query_one("#status", Static)
@@ -1807,15 +1809,19 @@ class DashboardApp(App):
         sess = self._selected_session_for_preview()
         if sess is None:
             return
-        if sess.id == self._last_preview_sid:
+        self._update_preview_for_session(sess.id)
+
+    def _update_preview_for_session(self, sid: str) -> None:
+        if not self.show_preview or not sid:
             return
-        self._last_preview_sid = sess.id
+        sess = next((s for s in self.sessions if s.id == sid), None)
+        if sess is None:
+            return
         try:
             preview = self.query_one("#preview", RichLog)
         except Exception:
             return
         preview.clear()
-        # Header line
         head = Text()
         head.append(f"{sess.short_id} ", style="bold")
         if sess.summary:
@@ -2091,17 +2097,79 @@ class DashboardApp(App):
         except Exception:
             pass
 
+    def _row_index_from_key(self, key) -> int | None:
+        """Resolve a Textual DataTable row key to our logical row index.
+
+        Variable-height rows in Textual can desync the integer
+        `coordinate.row` from our `self.row_keys` order. Always prefer the
+        explicit row key (which we set to the session id) when available.
+        """
+        if key is None:
+            return None
+        # Textual wraps keys in a RowKey object whose .value is the original
+        # str we passed to add_row. Some Textual versions just return the str.
+        val = getattr(key, "value", key)
+        if val is None:
+            return None
+        if isinstance(val, str):
+            if val.startswith("__sep__"):
+                # Separator row — find by reverse lookup in the separator map.
+                for idx, repo in self._separator_repos.items():
+                    if val == f"__sep__{repo}__{idx}":
+                        return idx
+                return None
+            try:
+                return self.row_keys.index(val)
+            except ValueError:
+                return None
+        return None
+
     def on_data_table_cell_highlighted(self, event) -> None:
         # Update the preview pane when the cursor moves to a different row.
+        # Resolve the row via row_key first to avoid the variable-row-height
+        # offset bug; fall back to coordinate.row.
         try:
-            self._update_preview_for_cursor()
+            cell_key = getattr(event, "cell_key", None)
+            row_key = getattr(cell_key, "row_key", None) if cell_key else None
+            idx = self._row_index_from_key(row_key)
+            if idx is None:
+                coord = getattr(event, "coordinate", None)
+                idx = coord.row if coord is not None else None
+            if idx is None:
+                return
+            sid = self.row_keys[idx] if 0 <= idx < len(self.row_keys) else ""
+            if sid and sid != self._last_preview_sid:
+                self._last_preview_sid = sid
+                if self.show_preview:
+                    self._update_preview_for_session(sid)
         except Exception:
             pass
 
     def on_data_table_cell_selected(self, event) -> None:
+        # Prefer row_key for hit-testing — variable-height rows desync the
+        # integer coordinate from our row_keys order.
+        cell_key = getattr(event, "cell_key", None)
+        row_key = getattr(cell_key, "row_key", None) if cell_key else None
+        col_key = getattr(cell_key, "column_key", None) if cell_key else None
+        row = self._row_index_from_key(row_key)
         coord = getattr(event, "coordinate", None)
-        row = coord.row if coord is not None else None
-        col = coord.column if coord is not None else None
+        if row is None and coord is not None:
+            row = coord.row
+        # Column index: try the column key first, then coordinate.column.
+        col = None
+        if col_key is not None:
+            try:
+                col_keys = getattr(self, "col_keys", [])
+                col_val = getattr(col_key, "value", col_key)
+                for i, k in enumerate(col_keys):
+                    kv = getattr(k, "value", k)
+                    if kv == col_val or k == col_key:
+                        col = i
+                        break
+            except Exception:
+                col = None
+        if col is None and coord is not None:
+            col = coord.column
         if row is None:
             try:
                 table = self.query_one(DataTable)
