@@ -79,6 +79,17 @@ def save_config(cfg: dict) -> None:
         pass
 
 
+def _file_debug(msg: str) -> None:
+    """Module-level debug logger (used outside the App class)."""
+    try:
+        log_path = Path.home() / ".copilot-dashboard" / "debug.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 def copilot_command(cfg: dict, *, resume_id: str | None = None) -> str:
     parts = ["copilot"]
     if cfg.get("yolo"):
@@ -1221,14 +1232,21 @@ def focus_session(session: "Session") -> tuple[bool, str]:
       1. Otherwise, use UI Automation to find a WT tab whose name matches
          a candidate (summary, copilot:short_id, short_id).
     """
+    _file_debug(
+        f"focus_session sid={session.id[:8]} short={session.short_id} "
+        f"pid={session.pid} running={session.running} "
+        f"summary={(session.summary or '')[:50]!r}"
+    )
     # Process-tree path (most reliable for live sessions).
     if session.pid or session.running:
         ok, msg = _focus_wt_tab_by_pid(session.id, session.pid)
+        _file_debug(f"  by_pid → ok={ok} msg={msg!r}")
         if ok:
             return True, msg
 
     candidates = [session.summary, f"copilot:{session.short_id}", session.short_id]
     matched, seen = _focus_wt_tab(candidates)
+    _file_debug(f"  by_title candidates={candidates!r} matched={matched!r}")
     if matched:
         return True, f"→ focused tab '{matched[:60]}'"
 
@@ -1981,11 +1999,17 @@ class DashboardApp(App):
 
     def _jump_row(self, idx: int | None) -> None:
         if idx is None or idx < 0 or idx >= len(self.row_keys):
+            self._debug(f"_jump_row out-of-range idx={idx} len={len(self.row_keys)}")
             return
         sid = self.row_keys[idx]
         sess = next((s for s in self.sessions if s.id == sid), None)
         if sess is None:
+            self._debug(f"_jump_row no session for sid={sid}")
             return
+        self._debug(
+            f"_jump_row idx={idx} sid={sid[:8]} short={sess.short_id} "
+            f"summary={(sess.summary or '')[:40]!r} pid={sess.pid} live={sess.is_live}"
+        )
         status = self.query_one("#status", Static)
         label = (sess.summary or sess.short_id).strip() or sess.short_id
         if sess.is_live:
@@ -2151,10 +2175,10 @@ class DashboardApp(App):
         cell_key = getattr(event, "cell_key", None)
         row_key = getattr(cell_key, "row_key", None) if cell_key else None
         col_key = getattr(cell_key, "column_key", None) if cell_key else None
-        row = self._row_index_from_key(row_key)
+        row_via_key = self._row_index_from_key(row_key)
         coord = getattr(event, "coordinate", None)
-        if row is None and coord is not None:
-            row = coord.row
+        coord_row = coord.row if coord is not None else None
+        row = row_via_key if row_via_key is not None else coord_row
         # Column index: try the column key first, then coordinate.column.
         col = None
         if col_key is not None:
@@ -2180,6 +2204,16 @@ class DashboardApp(App):
         if self.group_by_repo and row in self._separator_repos:
             self._toggle_collapse(self._separator_repos[row])
             return
+        try:
+            sid = self.row_keys[row] if 0 <= row < len(self.row_keys) else "(out-of-range)"
+            sess = next((s for s in self.sessions if s.id == sid), None)
+            label = (sess.summary or sess.short_id)[:50] if sess else "(none)"
+            self._debug(
+                f"cell_selected row_via_key={row_via_key} coord_row={coord_row} "
+                f"chosen_row={row} col={col} sid={sid[:8] if sid else ''} → {label!r}"
+            )
+        except Exception:
+            pass
         self._activate(row, col)
 
     def on_click(self, event) -> None:
