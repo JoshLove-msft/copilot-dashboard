@@ -1863,18 +1863,19 @@ class DashboardApp(App):
             sid = self.row_keys[row_idx]
             sess = next((s for s in self.sessions if s.id == sid), None)
             if sess:
-                urls = [u for _, u in (sess.prs or []) if u]
-                if not urls and sess.pr_url:
-                    urls = [sess.pr_url]
-                if urls:
+                # Per-link @click meta on each PR `Text` segment dispatches
+                # `action_open_pr(url)` for the specific PR clicked. Here in
+                # the cell-selected fallback (keyboard Enter, or a click on
+                # blank space inside the cell) we open just one PR — the
+                # highest-numbered one — rather than ALL of them, otherwise
+                # mouse clicks on a single link end up firing both this
+                # handler AND the per-link action and the user gets every
+                # PR launched.
+                url = sess.pr_url or (sess.prs[-1][1] if sess.prs else "")
+                if url:
                     import webbrowser
-                    for u in urls:
-                        webbrowser.open(u)
-                    if len(urls) == 1:
-                        msg = f"→ opened {urls[0]}"
-                    else:
-                        msg = f"→ opened {len(urls)} PRs"
-                    self.query_one("#status", Static).update(msg)
+                    webbrowser.open(url)
+                    self.query_one("#status", Static).update(f"→ opened {url}")
                     return
         self._jump_row(row_idx)
 
