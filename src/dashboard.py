@@ -1763,12 +1763,22 @@ class DashboardApp(App):
                 f"PR-watch: {len(watches)} watch(es), "
                 f"{launched} launched, {len(actionable)} actionable"
             )
+            self._pr_watch_summary_until = time.time() + 30.0
             try:
-                self.query_one("#status", Static).update(self._pr_watch_summary)
+                self.notify(
+                    self._pr_watch_summary,
+                    severity="information" if launched or actionable else "warning",
+                    timeout=8,
+                )
             except Exception:
                 pass
+            self._refresh_status_line()
         except Exception as exc:
             self._debug(f"pr-watch error: {exc}")
+            try:
+                self.notify(f"PR-watch error: {exc}", severity="error", timeout=10)
+            except Exception:
+                pass
         finally:
             self._pr_watch_in_flight = False
 
@@ -1776,8 +1786,9 @@ class DashboardApp(App):
         """Manually trigger a PR-watch poll cycle (bound to 'w')."""
         if not self.config.get("pr_watch_enabled"):
             try:
-                self.query_one("#status", Static).update(
-                    "[yellow]PR-watch is disabled (set pr_watch_enabled in config)[/yellow]"
+                self.notify(
+                    "PR-watch is disabled (set pr_watch_enabled in config)",
+                    severity="warning", timeout=6,
                 )
             except Exception:
                 pass
@@ -1785,16 +1796,17 @@ class DashboardApp(App):
         watches = self.config.get("pr_watches") or []
         if not watches:
             try:
-                self.query_one("#status", Static).update(
-                    "[yellow]No pr_watches configured[/yellow]"
-                )
+                self.notify("No pr_watches configured", severity="warning", timeout=6)
             except Exception:
                 pass
             return
         try:
-            self.query_one("#status", Static).update("[yellow]⏳ polling PRs…[/yellow]")
+            self.notify(f"⏳ polling {len(watches)} PR watch(es)…", timeout=4)
         except Exception:
             pass
+        self._pr_watch_summary = "⏳ polling PRs…"
+        self._pr_watch_summary_until = time.time() + 60.0
+        self._refresh_status_line()
         await self._do_pr_watch(watches)
 
     def _schedule_auto_refresh(self) -> None:
@@ -2101,7 +2113,17 @@ class DashboardApp(App):
         Cheap to call repeatedly (no table rebuild)."""
         try:
             suffix = getattr(self, "_status_suffix", "")
-            text = f"{self._countdown_text()}   {suffix}" if suffix else self._countdown_text()
+            # If we have a recent PR-watch summary, prepend it so it doesn't
+            # get clobbered by the per-second tick.
+            pw = getattr(self, "_pr_watch_summary", "")
+            pw_until = getattr(self, "_pr_watch_summary_until", 0)
+            if pw and time.time() < pw_until:
+                bits = [pw, self._countdown_text()]
+                if suffix:
+                    bits.append(suffix)
+                text = "   ".join(bits)
+            else:
+                text = f"{self._countdown_text()}   {suffix}" if suffix else self._countdown_text()
             self.query_one("#status", Static).update(text)
         except Exception:
             pass
