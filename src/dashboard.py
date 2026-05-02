@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -65,9 +66,11 @@ DEFAULT_CONFIG = {
         # {
         #   "name": "my open PRs",
         #   "query": "is:pr is:open author:@me",
-        #   "only_failing": true,           # only launch when CI is failing
-        #   "prompt": "monitor pr {url}",    # uses pr-copilot if installed
-        #   "cwd": null                      # null → user home
+        #   "title_contains": "fix",          # optional substring filter (case-insensitive)
+        #   "title_pattern": "^(fix|chore):", # optional regex filter
+        #   "only_failing": true,             # only launch when CI is failing
+        #   "prompt": "monitor pr {url}",     # uses pr-copilot if installed
+        #   "cwd": null                        # null → user home
         # }
     ],
 }
@@ -1324,6 +1327,18 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
         if not query:
             continue
         only_failing = bool(w.get("only_failing", True))
+        title_contains = (w.get("title_contains") or "").strip().lower()
+        title_pattern_src = (w.get("title_pattern") or "").strip()
+        title_re = None
+        if title_pattern_src:
+            try:
+                title_re = re.compile(title_pattern_src, re.IGNORECASE)
+            except re.error as exc:
+                _file_debug(
+                    f"pr-watch[{w.get('name')!r}]: bad title_pattern "
+                    f"{title_pattern_src!r}: {exc}"
+                )
+                continue
         # Force open state — closed PRs aren't actionable.
         gh_args = [
             "search", "prs", query, "--state=open", "--limit=50",
@@ -1339,6 +1354,14 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
             url = pr.get("url")
             if not url:
                 continue
+            title = pr.get("title") or ""
+            # Client-side title filters (apply BEFORE the per-PR check
+            # query — `gh pr checks` is the slow part and we don't want
+            # to spend that quota on PRs we'll discard.)
+            if title_contains and title_contains not in title.lower():
+                continue
+            if title_re is not None and not title_re.search(title):
+                continue
             failed: list[str] = []
             if only_failing:
                 f = _pr_failed_checks(url)
@@ -1352,7 +1375,7 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
             actionable.append({
                 "watch": w,
                 "url": url,
-                "title": pr.get("title") or "",
+                "title": title,
                 "number": pr.get("number"),
                 "repo": (pr.get("repository") or {}).get("nameWithOwner") if isinstance(pr.get("repository"), dict) else "",
                 "failed_checks": failed,
