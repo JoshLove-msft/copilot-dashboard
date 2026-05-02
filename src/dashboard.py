@@ -323,84 +323,101 @@ def _count_turns(events_path: Path, mtime: float) -> int:
     return _scan_events(events_path, mtime)[0]
 
 
-def _attach_store_data(sessions: list[Session]) -> None:
-    """Annotate sessions with PR refs + turn counts from `session-store.db`,
-    plus resolve canonical PR URLs from events.jsonl when possible.
+def _scan_events_for_prs(events_path: Path) -> dict[int, str]:
+    """Scan an events.jsonl file for GitHub PR URLs.
+
+    Returns {pr_number: canonical_url}. The first URL seen for each PR
+    number wins. Used as a fallback when session-store.db hasn't yet
+    indexed a fresh session (e.g. one launched seconds ago by PR-watch).
     """
-    if not SESSION_STORE_DB.exists():
-        return
-    import sqlite3
+    if not events_path.exists():
+        return {}
     import re
+    pat = re.compile(
+        r"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/(\d+)\b"
+    )
+    out: dict[int, str] = {}
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "/pull/" not in line:
+                    continue
+                for m in pat.finditer(line):
+                    try:
+                        pn = int(m.group(3))
+                    except ValueError:
+                        continue
+                    if pn not in out:
+                        out[pn] = m.group(0)
+    except OSError:
+        pass
+    return out
+
+
+def _attach_store_data(sessions: list[Session]) -> None:
+    """Annotate sessions with PR refs + turn counts.
+
+    Pulls PR refs from `session-store.db` (when available) AND scans each
+    session's events.jsonl for PR URLs as a fallback — fresh sessions
+    (e.g. those just launched by PR-watch) won't be in the store yet but
+    will already have the URL embedded in their first user message.
+    """
+    import re  # noqa: F401  (kept for back-compat with external callers)
     by_id = {s.id: s for s in sessions}
     if not by_id:
         return
-    try:
-        uri = f"file:{SESSION_STORE_DB.as_posix()}?mode=ro&immutable=1"
-        con = sqlite3.connect(uri, uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return
-    try:
-        # Turn counts + agent state come from events.jsonl (real-time). The
-        # session-store.db value is a stale snapshot from checkpoints.
-        for sess in sessions:
-            ev = SESSION_ROOT / sess.id / "events.jsonl"
-            if ev.exists() and sess.events_mtime > 0:
-                sess.turns, sess.agent_state = _scan_events(ev, sess.events_mtime)
-        # PR refs — collect ALL per session, not just the highest-numbered.
-        all_prs: dict[str, set[int]] = {}
+
+    # Turn counts + agent state come from events.jsonl (real-time).
+    for sess in sessions:
+        ev = SESSION_ROOT / sess.id / "events.jsonl"
+        if ev.exists() and sess.events_mtime > 0:
+            sess.turns, sess.agent_state = _scan_events(ev, sess.events_mtime)
+
+    # ----- PR refs: union of (session-store DB) ∪ (events.jsonl scan) -----
+    db_prs: dict[str, set[int]] = {}
+    if SESSION_STORE_DB.exists():
+        import sqlite3
         try:
-            for sid, val in con.execute(
-                "SELECT session_id, ref_value FROM session_refs WHERE ref_type='pr'"
-            ):
-                if sid not in by_id:
-                    continue
-                try:
-                    n = int(str(val))
-                except (TypeError, ValueError):
-                    continue
-                all_prs.setdefault(sid, set()).add(n)
+            uri = f"file:{SESSION_STORE_DB.as_posix()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True, timeout=1.0)
         except sqlite3.Error:
-            pass
-        for sid, nums in all_prs.items():
-            sess = by_id[sid]
-            sorted_nums = sorted(nums)
-            # Resolve canonical URL per PR via events.jsonl (one scan per file).
-            ev = SESSION_ROOT / sid / "events.jsonl"
-            url_by_n: dict[int, str] = {}
-            if ev.exists():
-                pat = re.compile(
-                    r"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/(\d+)\b"
-                )
-                try:
-                    with ev.open("r", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            if "/pull/" not in line:
-                                continue
-                            for m in pat.finditer(line):
-                                try:
-                                    pn = int(m.group(3))
-                                except ValueError:
-                                    continue
-                                if pn in nums and pn not in url_by_n:
-                                    url_by_n[pn] = m.group(0)
-                            if len(url_by_n) >= len(nums):
-                                break
-                except OSError:
-                    pass
-            sess.prs = []
-            for n in sorted_nums:
-                url = url_by_n.get(n) or (
-                    f"https://github.com/{sess.repository}/pull/{n}"
-                    if sess.repository else ""
-                )
-                sess.prs.append((n, url))
-            # Maintain back-compat single-PR fields (highest-numbered).
-            if sess.prs:
-                top_n, top_url = sess.prs[-1]
-                sess.pr = f"#{top_n}"
-                sess.pr_url = top_url
-    finally:
-        con.close()
+            con = None
+        if con is not None:
+            try:
+                for sid, val in con.execute(
+                    "SELECT session_id, ref_value FROM session_refs WHERE ref_type='pr'"
+                ):
+                    if sid not in by_id:
+                        continue
+                    try:
+                        n = int(str(val))
+                    except (TypeError, ValueError):
+                        continue
+                    db_prs.setdefault(sid, set()).add(n)
+            except sqlite3.Error:
+                pass
+            finally:
+                con.close()
+
+    for sid, sess in by_id.items():
+        ev = SESSION_ROOT / sid / "events.jsonl"
+        ev_urls = _scan_events_for_prs(ev)  # {n: url}
+        nums = set(db_prs.get(sid) or ()) | set(ev_urls.keys())
+        if not nums:
+            continue
+        sorted_nums = sorted(nums)
+        sess.prs = []
+        for n in sorted_nums:
+            url = ev_urls.get(n) or (
+                f"https://github.com/{sess.repository}/pull/{n}"
+                if sess.repository else ""
+            )
+            sess.prs.append((n, url))
+        # Maintain back-compat single-PR fields (highest-numbered).
+        top_n, top_url = sess.prs[-1]
+        sess.pr = f"#{top_n}"
+        sess.pr_url = top_url
+
 
 
 _SESSION_PATH_FRAG = os.path.normcase(os.path.join("session-state", ""))
