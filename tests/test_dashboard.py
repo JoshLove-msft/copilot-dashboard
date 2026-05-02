@@ -384,6 +384,16 @@ class TestPollPrWatches:
         ], {})
         assert sorted(i["number"] for i in items) == [12, 25]
 
+    def test_latest_only_false_returns_all_matches(self, monkeypatch):
+        monkeypatch.setattr(
+            D, "_run_gh_json",
+            lambda args, timeout=30.0: [_pr(1, "a"), _pr(2, "b"), _pr(3, "c")],
+        )
+        items = D.poll_pr_watches(
+            [_watch(only_failing=False, latest_only=False)], {}
+        )
+        assert sorted(i["number"] for i in items) == [1, 2, 3]
+
     def test_repo_extraction(self, monkeypatch):
         monkeypatch.setattr(
             D, "_run_gh_json",

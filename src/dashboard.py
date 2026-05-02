@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
         #   "query": "is:pr is:open author:@me",
         #   "title_contains": "fix",          # optional substring filter (case-insensitive)
         #   "title_pattern": "^(fix|chore):", # optional regex filter
+        #   "latest_only": true,              # when multiple match, only act on the highest-numbered (default true)
         #   "only_failing": true,             # only launch when CI is failing
         #   "prompt": "monitor pr {url}",     # uses pr-copilot if installed
         #   "cwd": null                        # null → user home
@@ -1344,6 +1345,7 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
         if not query:
             continue
         only_failing = bool(w.get("only_failing", True))
+        latest_only = bool(w.get("latest_only", True))
         title_contains = (w.get("title_contains") or "").strip().lower()
         title_pattern_src = (w.get("title_pattern") or "").strip()
         title_re = None
@@ -1365,10 +1367,10 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
         if not isinstance(prs, list):
             _file_debug(f"pr-watch[{w.get('name')!r}]: search returned no list")
             continue
-        # Apply client-side title filters first (cheap), then narrow to
-        # the single latest matching PR (highest PR number wins — these
-        # auto-bump PRs are monotonically numbered, and using number
-        # avoids depending on commit-vs-update timestamps).
+        # Apply client-side title filters first (cheap). When latest_only
+        # is set (default), narrow to the single highest-numbered matching
+        # PR before the per-PR `gh pr checks` call — auto-bump PRs are
+        # monotonically numbered so that's the most reliable "latest" signal.
         candidates = []
         for pr in prs:
             if not isinstance(pr, dict):
@@ -1383,11 +1385,14 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
             candidates.append(pr)
         if not candidates:
             continue
-        try:
-            candidates.sort(key=lambda p: int(p.get("number") or 0), reverse=True)
-        except (TypeError, ValueError):
-            pass
-        prs_to_check = candidates[:1]  # latest only
+        if latest_only:
+            try:
+                candidates.sort(key=lambda p: int(p.get("number") or 0), reverse=True)
+            except (TypeError, ValueError):
+                pass
+            prs_to_check = candidates[:1]
+        else:
+            prs_to_check = candidates
         for pr in prs_to_check:
             url = pr.get("url")
             title = pr.get("title") or ""
