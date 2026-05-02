@@ -273,26 +273,29 @@ class TestPollPrWatches:
         items = D.poll_pr_watches([None, "x", _watch()], {})
         assert items == []
 
-    def test_returns_all_when_no_filters_and_only_failing_false(self, monkeypatch):
+    def test_returns_only_latest_when_no_filters_and_only_failing_false(self, monkeypatch):
+        # Watcher is single-PR-per-cycle: highest PR number wins.
         monkeypatch.setattr(D, "_run_gh_json",
                             lambda args, timeout=30.0: [_pr(1, "fix"), _pr(2, "feat")])
         items = D.poll_pr_watches([_watch(only_failing=False)], {})
-        assert [i["number"] for i in items] == [1, 2]
+        assert [i["number"] for i in items] == [2]
         assert items[0]["fingerprint"] == "any"
 
     def test_title_contains_filter_case_insensitive(self, monkeypatch):
         monkeypatch.setattr(D, "_run_gh_json",
                             lambda args, timeout=30.0: [_pr(1, "FIX bug"), _pr(2, "feat")])
         items = D.poll_pr_watches([_watch(title_contains="fix")], {})
+        # Only PR 1 matches the filter, so only PR 1 is returned.
         assert [i["number"] for i in items] == [1]
 
-    def test_title_pattern_filter(self, monkeypatch):
+    def test_title_pattern_filter_picks_latest_matching(self, monkeypatch):
         monkeypatch.setattr(
             D, "_run_gh_json",
             lambda args, timeout=30.0: [_pr(1, "fix: a"), _pr(2, "chore: b"), _pr(3, "feat: c")],
         )
+        # Two match the pattern; keep only the latest (highest number).
         items = D.poll_pr_watches([_watch(title_pattern=r"^(fix|chore):")], {})
-        assert [i["number"] for i in items] == [1, 2]
+        assert [i["number"] for i in items] == [2]
 
     def test_invalid_pattern_skips_watch(self, monkeypatch):
         called = {"n": 0}
@@ -308,6 +311,8 @@ class TestPollPrWatches:
         assert called["n"] == 0
 
     def test_only_failing_drops_clean_prs(self, monkeypatch):
+        # Latest is #2 — its checks are clean ⇒ skipped (and we don't
+        # fall back to older PRs; "latest only" means latest only).
         monkeypatch.setattr(D, "_run_gh_json",
                             lambda args, timeout=30.0: [_pr(1, "x"), _pr(2, "y")])
 
@@ -316,8 +321,7 @@ class TestPollPrWatches:
 
         monkeypatch.setattr(D, "_pr_failed_checks", fake_checks)
         items = D.poll_pr_watches([_watch(only_failing=True)], {})
-        assert [i["number"] for i in items] == [1]
-        assert items[0]["fingerprint"] == "ci/build"
+        assert items == []
 
     def test_only_failing_drops_when_check_query_returns_none(self, monkeypatch):
         # `None` from _pr_failed_checks means "no info" — skip.
@@ -359,6 +363,26 @@ class TestPollPrWatches:
             title_pattern=r"foo",
         )], {})
         assert [i["number"] for i in items] == [1]
+
+    def test_picks_latest_per_watch_independently(self, monkeypatch):
+        # Two watches in the same poll cycle — each should yield ONE PR
+        # (its respective latest), not be merged.
+        prs_by_query = {
+            "watch-a": [_pr(10, "A v1"), _pr(11, "A v2"), _pr(12, "A v3")],
+            "watch-b": [_pr(20, "B v1"), _pr(25, "B v2")],
+        }
+
+        def fake(args, timeout=30.0):
+            # args = ['search', 'prs', <query>, ...]
+            q = args[2]
+            return prs_by_query.get(q, [])
+
+        monkeypatch.setattr(D, "_run_gh_json", fake)
+        items = D.poll_pr_watches([
+            _watch(name="A", query="watch-a", only_failing=False),
+            _watch(name="B", query="watch-b", only_failing=False),
+        ], {})
+        assert sorted(i["number"] for i in items) == [12, 25]
 
     def test_repo_extraction(self, monkeypatch):
         monkeypatch.setattr(

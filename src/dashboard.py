@@ -1365,20 +1365,32 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
         if not isinstance(prs, list):
             _file_debug(f"pr-watch[{w.get('name')!r}]: search returned no list")
             continue
+        # Apply client-side title filters first (cheap), then narrow to
+        # the single latest matching PR (highest PR number wins — these
+        # auto-bump PRs are monotonically numbered, and using number
+        # avoids depending on commit-vs-update timestamps).
+        candidates = []
         for pr in prs:
             if not isinstance(pr, dict):
                 continue
-            url = pr.get("url")
-            if not url:
+            if not pr.get("url"):
                 continue
             title = pr.get("title") or ""
-            # Client-side title filters (apply BEFORE the per-PR check
-            # query — `gh pr checks` is the slow part and we don't want
-            # to spend that quota on PRs we'll discard.)
             if title_contains and title_contains not in title.lower():
                 continue
             if title_re is not None and not title_re.search(title):
                 continue
+            candidates.append(pr)
+        if not candidates:
+            continue
+        try:
+            candidates.sort(key=lambda p: int(p.get("number") or 0), reverse=True)
+        except (TypeError, ValueError):
+            pass
+        prs_to_check = candidates[:1]  # latest only
+        for pr in prs_to_check:
+            url = pr.get("url")
+            title = pr.get("title") or ""
             failed: list[str] = []
             if only_failing:
                 f = _pr_failed_checks(url)
