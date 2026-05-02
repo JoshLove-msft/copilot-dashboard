@@ -52,6 +52,24 @@ DEFAULT_CONFIG = {
     "yolo": True,                # pass --yolo when launching copilot
     "autopilot": True,           # pass --autopilot when launching copilot
     "refresh_interval": 30,      # auto-refresh interval, seconds
+    # PR-watch: periodically search GitHub for PRs matching one or more
+    # queries and auto-launch a Copilot CLI session for each one. The
+    # default prompt template ("monitor pr {url}") is designed to hand
+    # off to the pr-copilot MCP server (https://github.com/m-nash/pr-copilot)
+    # which does the actual CI-failure investigation, comment handling,
+    # and merge automation.
+    "pr_watch_enabled": False,
+    "pr_watch_interval_minutes": 10,
+    "pr_watches": [
+        # Example shape (edit the config file to add):
+        # {
+        #   "name": "my open PRs",
+        #   "query": "is:pr is:open author:@me",
+        #   "only_failing": true,           # only launch when CI is failing
+        #   "prompt": "monitor pr {url}",    # uses pr-copilot if installed
+        #   "cwd": null                      # null → user home
+        # }
+    ],
 }
 
 
@@ -1221,6 +1239,194 @@ def launch_session_tab(session: "Session", cfg: dict | None = None) -> tuple[boo
     return True, f"→ launched {session.short_id} as new console window"
 
 
+# ─── PR-watch ──────────────────────────────────────────────────────────────
+#
+# Periodically poll GitHub for PRs matching one or more configured queries
+# and spawn a Copilot CLI session for each newly-discovered PR (deduped via
+# a state file). The default prompt template ("monitor pr {url}") hands off
+# to the pr-copilot MCP server (https://github.com/m-nash/pr-copilot) when
+# installed, which then drives CI investigation, comment handling, etc.
+
+PR_WATCH_STATE_PATH = Path.home() / ".copilot-dashboard" / "pr-watch-state.json"
+DEFAULT_PR_WATCH_PROMPT = "monitor pr {url}"
+
+
+def _run_gh_json(args: list[str], timeout: float = 30.0) -> object | None:
+    """Run a `gh` subcommand expecting JSON on stdout. Returns parsed JSON
+    or None on any failure (auth, network, gh missing, malformed JSON)."""
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _file_debug(f"pr-watch: gh failed: {e}")
+        return None
+    if proc.returncode != 0:
+        _file_debug(f"pr-watch: gh {' '.join(args[:3])} rc={proc.returncode} err={(proc.stderr or '').strip()[:200]}")
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _load_pr_watch_state() -> dict:
+    try:
+        if PR_WATCH_STATE_PATH.exists():
+            data = json.loads(PR_WATCH_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_pr_watch_state(state: dict) -> None:
+    try:
+        PR_WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PR_WATCH_STATE_PATH.write_text(
+            json.dumps(state, indent=2) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _pr_failed_checks(pr_url: str) -> list[str] | None:
+    """Return a list of failed check names for a PR, or None if checks
+    can't be queried (treat as 'no info', skip)."""
+    data = _run_gh_json(["pr", "checks", pr_url, "--json", "bucket,name,state"])
+    if not isinstance(data, list):
+        return None
+    out = []
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        if (c.get("bucket") or "").lower() == "fail":
+            out.append(c.get("name") or c.get("state") or "?")
+    return out
+
+
+def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
+    """Run all watches and return a list of actionable items to launch.
+
+    An item is actionable when it's a new (url, fingerprint) combination
+    not already recorded in state. The fingerprint is the sorted set of
+    failed-check names (so a PR with new failures relaunches even if we
+    saw the PR already).
+    """
+    actionable: list[dict] = []
+    for w in watches:
+        if not isinstance(w, dict):
+            continue
+        query = (w.get("query") or "").strip()
+        if not query:
+            continue
+        only_failing = bool(w.get("only_failing", True))
+        # Force open state — closed PRs aren't actionable.
+        gh_args = [
+            "search", "prs", query, "--state=open", "--limit=50",
+            "--json", "number,url,title,repository,updatedAt",
+        ]
+        prs = _run_gh_json(gh_args, timeout=45.0)
+        if not isinstance(prs, list):
+            _file_debug(f"pr-watch[{w.get('name')!r}]: search returned no list")
+            continue
+        for pr in prs:
+            if not isinstance(pr, dict):
+                continue
+            url = pr.get("url")
+            if not url:
+                continue
+            failed: list[str] = []
+            if only_failing:
+                f = _pr_failed_checks(url)
+                if not f:  # None or empty
+                    continue
+                failed = f
+            fp = "|".join(sorted(failed)) if failed else "any"
+            prev = state.get(url) or {}
+            if prev.get("fingerprint") == fp:
+                continue  # already handled this exact failure set
+            actionable.append({
+                "watch": w,
+                "url": url,
+                "title": pr.get("title") or "",
+                "number": pr.get("number"),
+                "repo": (pr.get("repository") or {}).get("nameWithOwner") if isinstance(pr.get("repository"), dict) else "",
+                "failed_checks": failed,
+                "fingerprint": fp,
+            })
+    return actionable
+
+
+def launch_pr_watch_session(item: dict, cfg: dict) -> tuple[bool, str]:
+    """Spawn a Copilot CLI tab for a PR-watch hit.
+
+    The prompt is built from the watch's `prompt` template (defaults to
+    "monitor pr {url}") and the agent is launched with -i so it auto-runs
+    that prompt at startup.
+    """
+    watch = item.get("watch") or {}
+    template = (watch.get("prompt") or DEFAULT_PR_WATCH_PROMPT).strip()
+    failed_str = ", ".join(item.get("failed_checks") or []) or "none"
+    try:
+        prompt = template.format(
+            url=item.get("url", ""),
+            title=item.get("title", ""),
+            number=item.get("number", ""),
+            repo=item.get("repo", ""),
+            failed_checks=failed_str,
+        )
+    except Exception:
+        prompt = template
+
+    cwd = (watch.get("cwd") or "").strip() or os.path.expanduser("~")
+    shell = _resolve_shell()
+    parts = ["copilot"]
+    if cfg.get("yolo"):
+        parts.append("--yolo")
+    if cfg.get("autopilot"):
+        parts.append("--autopilot")
+    # -i launches interactive mode and immediately executes the prompt.
+    # Quote the prompt for the shell so PowerShell handles it correctly.
+    safe_prompt = prompt.replace("'", "''")
+    parts.append("-i")
+    parts.append(f"'{safe_prompt}'")
+    cmd = " ".join(parts)
+    inner = [shell, "-NoExit", "-Command", cmd]
+    title = f"PR #{item.get('number')} • {(item.get('title') or '')[:50]}"
+
+    wt = _resolve_wt()
+    if wt:
+        argv = [
+            wt, "-w", "0", "new-tab",
+            "--suppressApplicationTitle",
+            "--title", title,
+            "-d", cwd if os.path.isdir(cwd) else os.path.expanduser("~"),
+            "--", *inner,
+        ]
+        ok, err = _spawn_wt(argv, cwd)
+        if not ok:
+            return False, err
+        return True, f"→ launched PR-watch tab for #{item.get('number')}"
+    # No WT — spawn detached console.
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        subprocess.Popen(
+            inner,
+            cwd=cwd if os.path.isdir(cwd) else None,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return False, f"launch failed: {e}"
+    return True, f"→ launched PR-watch console for #{item.get('number')}"
+
+
 def focus_session(session: "Session") -> tuple[bool, str]:
     """Surface an already-open session.
 
@@ -1393,6 +1599,7 @@ class DashboardApp(App):
         Binding("l", "toggle_live", "Live only"),
         Binding("g", "toggle_group", "Group by repo"),
         Binding("p", "toggle_preview", "Preview"),
+        Binding("w", "pr_watch_now", "Poll PRs"),
         Binding("v", "open_in_vscode", "Open in VSCode"),
         Binding("s", "open_settings", "Settings"),
         Binding("q", "quit", "Quit"),
@@ -1461,6 +1668,94 @@ class DashboardApp(App):
         # than set_interval so that a transient exception in the callback
         # cannot stop the timer permanently.
         self._schedule_tick()
+        # PR-watch (only if enabled) — separate self-rescheduling timer.
+        self._pr_watch_in_flight = False
+        self._last_pr_watch: float = 0.0
+        self._pr_watch_summary: str = ""
+        if self.config.get("pr_watch_enabled"):
+            self._schedule_pr_watch(initial=True)
+
+    def _schedule_pr_watch(self, *, initial: bool = False) -> None:
+        try:
+            mins = max(1, int(self.config.get("pr_watch_interval_minutes", 10)))
+        except (TypeError, ValueError):
+            mins = 10
+        # Run the first poll quickly (5s after mount) so the user gets
+        # feedback; subsequent polls honor the configured interval.
+        delay = 5.0 if initial else mins * 60.0
+        try:
+            self.set_timer(delay, self._pr_watch_kick)
+        except Exception:
+            pass
+
+    def _pr_watch_kick(self) -> None:
+        # Re-arm first so a failure here can't kill the timer.
+        self._schedule_pr_watch()
+        if not self.config.get("pr_watch_enabled"):
+            return
+        if self._pr_watch_in_flight:
+            return
+        watches = self.config.get("pr_watches") or []
+        if not watches:
+            return
+        self.run_worker(self._do_pr_watch(watches), exclusive=False, group="pr_watch")
+
+    async def _do_pr_watch(self, watches: list) -> None:
+        self._pr_watch_in_flight = True
+        try:
+            state = await asyncio.to_thread(_load_pr_watch_state)
+            actionable = await asyncio.to_thread(poll_pr_watches, watches, state)
+            launched = 0
+            for item in actionable:
+                ok, msg = await asyncio.to_thread(launch_pr_watch_session, item, self.config)
+                self._debug(f"pr-watch launch: {msg}")
+                if ok:
+                    launched += 1
+                    state[item["url"]] = {
+                        "fingerprint": item["fingerprint"],
+                        "title": item.get("title", ""),
+                        "watch": (item.get("watch") or {}).get("name", ""),
+                        "launched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+            await asyncio.to_thread(_save_pr_watch_state, state)
+            self._last_pr_watch = time.time()
+            self._pr_watch_summary = (
+                f"PR-watch: {len(watches)} watch(es), "
+                f"{launched} launched, {len(actionable)} actionable"
+            )
+            try:
+                self.query_one("#status", Static).update(self._pr_watch_summary)
+            except Exception:
+                pass
+        except Exception as exc:
+            self._debug(f"pr-watch error: {exc}")
+        finally:
+            self._pr_watch_in_flight = False
+
+    async def action_pr_watch_now(self) -> None:
+        """Manually trigger a PR-watch poll cycle (bound to 'w')."""
+        if not self.config.get("pr_watch_enabled"):
+            try:
+                self.query_one("#status", Static).update(
+                    "[yellow]PR-watch is disabled (set pr_watch_enabled in config)[/yellow]"
+                )
+            except Exception:
+                pass
+            return
+        watches = self.config.get("pr_watches") or []
+        if not watches:
+            try:
+                self.query_one("#status", Static).update(
+                    "[yellow]No pr_watches configured[/yellow]"
+                )
+            except Exception:
+                pass
+            return
+        try:
+            self.query_one("#status", Static).update("[yellow]⏳ polling PRs…[/yellow]")
+        except Exception:
+            pass
+        await self._do_pr_watch(watches)
 
     def _schedule_auto_refresh(self) -> None:
         try:
