@@ -403,6 +403,26 @@ class TestPollPrWatches:
         assert items[0]["repo"] == "myorg/myrepo"
 
 
+class TestDefaultPrWatchPrompt:
+    def test_default_prompt_formats_with_all_fields(self):
+        # Sanity: the built-in prompt template must accept every field
+        # launch_pr_watch_session passes in (so no KeyError at runtime).
+        out = D.DEFAULT_PR_WATCH_PROMPT.format(
+            url="https://github.com/o/r/pull/42",
+            number=42,
+            repo="o/r",
+            title="Fix the thing",
+            failed_checks="ci/build, ci/test",
+        )
+        assert "https://github.com/o/r/pull/42" in out
+        assert "ci/build" in out
+        # Should contain a `gh pr` invocation hint.
+        assert "gh pr" in out
+        # Should not mention the legacy monitor-pr / pr-copilot integration.
+        assert "monitor pr" not in out.lower()
+        assert "pr-copilot" not in out.lower()
+
+
 # --------------------------------------------------------------------------- #
 # _first_user_message
 # --------------------------------------------------------------------------- #

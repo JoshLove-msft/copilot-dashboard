@@ -54,23 +54,22 @@ DEFAULT_CONFIG = {
     "autopilot": True,           # pass --autopilot when launching copilot
     "refresh_interval": 30,      # auto-refresh interval, seconds
     # PR-watch: periodically search GitHub for PRs matching one or more
-    # queries and auto-launch a Copilot CLI session for each one. The
-    # default prompt template ("monitor pr {url}") is designed to hand
-    # off to the pr-copilot MCP server (https://github.com/m-nash/pr-copilot)
-    # which does the actual CI-failure investigation, comment handling,
-    # and merge automation.
+    # queries and auto-launch a Copilot CLI session pre-loaded with PR
+    # context (URL, title, failed CI checks). The Copilot session uses
+    # `gh pr view / pr checks / pr diff / pr comment` to inspect and act
+    # on the PR — no external server required.
     "pr_watch_enabled": False,
     "pr_watch_interval_minutes": 10,
     "pr_watches": [
         # Example shape (edit the config file to add):
         # {
         #   "name": "my open PRs",
-        #   "query": "is:pr is:open author:@me",
+        #   "query": "author:@me",
         #   "title_contains": "fix",          # optional substring filter (case-insensitive)
         #   "title_pattern": "^(fix|chore):", # optional regex filter
         #   "latest_only": true,              # when multiple match, only act on the highest-numbered (default true)
         #   "only_failing": true,             # only launch when CI is failing
-        #   "prompt": "monitor pr {url}",     # uses pr-copilot if installed
+        #   "prompt": null,                    # null → use built-in PR-context prompt; otherwise a template with {url} {number} {repo} {title} {failed_checks}
         #   "cwd": null                        # null → user home
         # }
     ],
@@ -1263,13 +1262,18 @@ def launch_session_tab(session: "Session", cfg: dict | None = None) -> tuple[boo
 # ─── PR-watch ──────────────────────────────────────────────────────────────
 #
 # Periodically poll GitHub for PRs matching one or more configured queries
-# and spawn a Copilot CLI session for each newly-discovered PR (deduped via
-# a state file). The default prompt template ("monitor pr {url}") hands off
-# to the pr-copilot MCP server (https://github.com/m-nash/pr-copilot) when
-# installed, which then drives CI investigation, comment handling, etc.
+# and spawn a Copilot CLI session pre-loaded with PR context (URL, title,
+# failed CI checks). The session is "attached to the PR" via the prompt —
+# Copilot uses `gh` (pr view / pr diff / pr checks) to inspect and act on it.
 
 PR_WATCH_STATE_PATH = Path.home() / ".copilot-dashboard" / "pr-watch-state.json"
-DEFAULT_PR_WATCH_PROMPT = "monitor pr {url}"
+DEFAULT_PR_WATCH_PROMPT = (
+    "You are attached to GitHub PR {url} (#{number} in {repo}): \"{title}\". "
+    "Failing CI checks: {failed_checks}. "
+    "Investigate the failures using `gh pr checks {url}`, `gh pr view {url}`, "
+    "and `gh pr diff {url}`. Identify the root cause and propose (or apply) a fix. "
+    "Reply directly on the PR via `gh pr comment {url} -b ...` when appropriate."
+)
 
 
 def _run_gh_json(args: list[str], timeout: float = 30.0) -> object | None:
@@ -1419,11 +1423,13 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
 
 
 def launch_pr_watch_session(item: dict, cfg: dict) -> tuple[bool, str]:
-    """Spawn a Copilot CLI tab for a PR-watch hit.
+    """Spawn a Copilot CLI tab attached to a PR-watch hit.
 
-    The prompt is built from the watch's `prompt` template (defaults to
-    "monitor pr {url}") and the agent is launched with -i so it auto-runs
-    that prompt at startup.
+    The Copilot session is launched with -i and a prompt assembled from
+    the watch's `prompt` template (or the built-in DEFAULT_PR_WATCH_PROMPT
+    which gives Copilot full PR context: URL, title, repo, number, and
+    the list of failing CI checks). The session uses `gh` to inspect and
+    act on the PR — no external monitoring server is required.
     """
     watch = item.get("watch") or {}
     template = (watch.get("prompt") or DEFAULT_PR_WATCH_PROMPT).strip()
