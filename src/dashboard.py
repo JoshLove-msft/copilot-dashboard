@@ -333,7 +333,8 @@ def _scan_events_for_prs(
     events_path: Path,
     *,
     wanted: set[int] | None = None,
-    head_only_kb: int | None = 128,
+    head_only_kb: int = 256,
+    full_scan_max_mb: int = 8,
 ) -> dict[int, str]:
     """Scan an events.jsonl file for GitHub PR URLs.
 
@@ -347,6 +348,10 @@ def _scan_events_for_prs(
     `head_only_kb`: when `wanted` is None, only the first N KB are read
     so live sessions with multi-MB logs don't block the refresh worker.
     PR URLs in PR-watch sessions appear in the first user message anyway.
+
+    `full_scan_max_mb`: when head-only finds nothing AND the file is at
+    most this size, fall back to a full scan so we still catch sessions
+    where the PR URL only shows up later (e.g. as a `gh pr view` arg).
     """
     if not events_path.exists():
         return {}
@@ -354,7 +359,9 @@ def _scan_events_for_prs(
         st = events_path.stat()
     except OSError:
         return {}
-    mode = f"w{sorted(wanted)}" if wanted else f"h{head_only_kb}"
+    mode = (
+        f"w{sorted(wanted)}" if wanted else f"h{head_only_kb}f{full_scan_max_mb}"
+    )
     cache_key = (str(events_path), st.st_mtime, st.st_size, mode)
     cached = _PR_SCAN_CACHE.get(cache_key)
     if cached is not None:
@@ -362,7 +369,6 @@ def _scan_events_for_prs(
     out: dict[int, str] = {}
     try:
         if wanted:
-            # Full-file scan with early termination.
             target = set(wanted)
             with events_path.open("rb") as f:
                 for raw in f:
@@ -379,11 +385,10 @@ def _scan_events_for_prs(
                     if target.issubset(out.keys()):
                         break
         else:
-            cap = (head_only_kb or 128) * 1024
+            cap = head_only_kb * 1024
             with events_path.open("rb") as f:
                 buf = f.read(cap)
-            text = buf.decode("utf-8", errors="replace")
-            for line in text.splitlines():
+            for line in buf.decode("utf-8", errors="replace").splitlines():
                 if "/pull/" not in line:
                     continue
                 for m in _PR_SCAN_PAT.finditer(line):
@@ -393,10 +398,29 @@ def _scan_events_for_prs(
                         continue
                     if pn not in out:
                         out[pn] = m.group(0)
+            # Fallback: if the head said nothing but the file is small
+            # enough, do a full scan so we don't miss PRs that are
+            # mentioned later (e.g. via `gh pr view <url>` mid-session).
+            if (
+                not out
+                and st.st_size > cap
+                and st.st_size <= full_scan_max_mb * 1024 * 1024
+            ):
+                with events_path.open("rb") as f:
+                    f.seek(cap)
+                    rest = f.read()
+                for line in rest.decode("utf-8", errors="replace").splitlines():
+                    if "/pull/" not in line:
+                        continue
+                    for m in _PR_SCAN_PAT.finditer(line):
+                        try:
+                            pn = int(m.group(3))
+                        except ValueError:
+                            continue
+                        if pn not in out:
+                            out[pn] = m.group(0)
     except OSError:
         pass
-    # Evict stale entries for the same (path, mode) so the cache doesn't
-    # grow unbounded as sessions are updated.
     for k in [k for k in _PR_SCAN_CACHE if k[0] == str(events_path) and k[3] == mode]:
         _PR_SCAN_CACHE.pop(k, None)
     _PR_SCAN_CACHE[cache_key] = out
