@@ -1745,6 +1745,7 @@ class DashboardApp(App):
         Binding("l", "toggle_live", "Live only"),
         Binding("g", "toggle_group", "Group by repo"),
         Binding("p", "toggle_preview", "Preview"),
+        Binding("o", "open_current_pr", "Open PR"),
         Binding("w", "pr_watch_now", "Poll PRs"),
         Binding("v", "open_in_vscode", "Open in VSCode"),
         Binding("s", "open_settings", "Settings"),
@@ -2127,6 +2128,10 @@ class DashboardApp(App):
             pr_cell: object = ""
             if s.prs:
                 # Build a multi-line clickable Text with one PR per line.
+                # Use Rich's `link=` so the terminal emulator (Windows
+                # Terminal, iTerm2, etc.) handles the click via OSC 8 —
+                # DataTable swallows widget-level clicks, so a Style.meta
+                # `@click` action would never fire here.
                 pr_text = Text()
                 for i, (n, url) in enumerate(s.prs):
                     if i:
@@ -2138,7 +2143,7 @@ class DashboardApp(App):
                             style=Style(
                                 color="cyan",
                                 underline=True,
-                                meta={"@click": f"open_pr({url!r})"},
+                                link=url,
                             ),
                         )
                     else:
@@ -2151,7 +2156,7 @@ class DashboardApp(App):
                         style=Style(
                             color="cyan",
                             underline=True,
-                            meta={"@click": f"open_pr({s.pr_url!r})"},
+                            link=s.pr_url,
                         ),
                     )
                 else:
@@ -2338,6 +2343,31 @@ class DashboardApp(App):
         import webbrowser
         webbrowser.open(url)
         self.query_one("#status", Static).update(f"→ opened {url}")
+
+    def action_open_current_pr(self) -> None:
+        """Open the PR for the currently-selected row in the browser.
+
+        Useful when the terminal doesn't honor OSC 8 hyperlinks (or
+        DataTable swallowed the click).
+        """
+        try:
+            table = self.query_one(DataTable)
+            idx = table.cursor_row
+        except Exception:
+            return
+        if idx is None or not (0 <= idx < len(self.row_keys)):
+            return
+        sid = self.row_keys[idx]
+        sess = next((s for s in self.sessions if s.id == sid), None)
+        if not sess:
+            return
+        url = sess.pr_url or (sess.prs[-1][1] if sess.prs else "")
+        if not url:
+            self.notify("No PR linked to this session", timeout=3)
+            return
+        import webbrowser
+        webbrowser.open(url)
+        self.notify(f"Opened {url}", timeout=4)
 
     def action_new_session(self) -> None:
         # Use the currently selected row's cwd as the starting dir, if any.
