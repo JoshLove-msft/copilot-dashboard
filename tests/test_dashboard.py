@@ -621,3 +621,38 @@ class TestAttachStoreDataFallback:
         D._attach_store_data([sess])
         assert [n for n, _ in sess.prs] == [100, 175, 250]
         assert sess.pr == "#250"
+
+
+class TestFilterActionableByActive:
+    def test_drops_items_whose_url_is_active(self):
+        actionable = [
+            {"url": "https://github.com/o/r/pull/1", "fingerprint": "any"},
+            {"url": "https://github.com/o/r/pull/2", "fingerprint": "any"},
+            {"url": "https://github.com/o/r/pull/3", "fingerprint": "any"},
+        ]
+        active = {"https://github.com/o/r/pull/2"}
+        kept, skipped = D.filter_actionable_by_active(actionable, active)
+        assert skipped == 1
+        assert [i["url"] for i in kept] == [
+            "https://github.com/o/r/pull/1",
+            "https://github.com/o/r/pull/3",
+        ]
+
+    def test_no_active_keeps_everything(self):
+        actionable = [{"url": "https://github.com/o/r/pull/1", "fingerprint": "any"}]
+        kept, skipped = D.filter_actionable_by_active(actionable, set())
+        assert skipped == 0
+        assert kept == actionable
+
+    def test_all_active_returns_empty(self):
+        actionable = [
+            {"url": "https://github.com/o/r/pull/1", "fingerprint": "any"},
+            {"url": "https://github.com/o/r/pull/2", "fingerprint": "any"},
+        ]
+        active = {
+            "https://github.com/o/r/pull/1",
+            "https://github.com/o/r/pull/2",
+        }
+        kept, skipped = D.filter_actionable_by_active(actionable, active)
+        assert kept == []
+        assert skipped == 2

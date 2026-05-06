@@ -1505,6 +1505,23 @@ def poll_pr_watches(watches: list[dict], state: dict) -> list[dict]:
     return actionable
 
 
+def filter_actionable_by_active(
+    actionable: list[dict], active_pr_urls: set[str]
+) -> tuple[list[dict], int]:
+    """Drop actionable PR-watch items whose URL already has an active session.
+
+    Returns (kept, skipped_count). Pure / testable.
+    """
+    kept: list[dict] = []
+    skipped = 0
+    for item in actionable:
+        if item.get("url") in active_pr_urls:
+            skipped += 1
+            continue
+        kept.append(item)
+    return kept, skipped
+
+
 def launch_pr_watch_session(item: dict, cfg: dict) -> tuple[bool, str]:
     """Spawn a Copilot CLI tab attached to a PR-watch hit.
 
@@ -1852,6 +1869,20 @@ class DashboardApp(App):
         try:
             state = await asyncio.to_thread(_load_pr_watch_state)
             actionable = await asyncio.to_thread(poll_pr_watches, watches, state)
+            # Drop any PRs that already have an active session attached —
+            # no point spawning a second one to do the same work.
+            active_pr_urls: set[str] = set()
+            for sess in self.sessions:
+                if not sess.is_live:
+                    continue
+                for _, url in (sess.prs or []):
+                    if url:
+                        active_pr_urls.add(url)
+                if sess.pr_url:
+                    active_pr_urls.add(sess.pr_url)
+            actionable, skipped_active = filter_actionable_by_active(
+                actionable, active_pr_urls
+            )
             launched = 0
             for item in actionable:
                 ok, msg = await asyncio.to_thread(launch_pr_watch_session, item, self.config)
@@ -1866,9 +1897,10 @@ class DashboardApp(App):
                     }
             await asyncio.to_thread(_save_pr_watch_state, state)
             self._last_pr_watch = time.time()
+            skip_note = f", {skipped_active} skipped (active)" if skipped_active else ""
             self._pr_watch_summary = (
                 f"PR-watch: {len(watches)} watch(es), "
-                f"{launched} launched, {len(actionable)} actionable"
+                f"{launched} launched, {len(actionable)} actionable{skip_note}"
             )
             self._pr_watch_summary_until = time.time() + 30.0
             try:
