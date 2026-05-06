@@ -256,6 +256,65 @@ def load_sessions(root: Path = SESSION_ROOT) -> list[Session]:
 
 
 _TURNS_CACHE: dict[str, tuple[float, int, str]] = {}  # session_id → (events_mtime, turns, agent_state)
+_SCAN_CACHE_PATH = Path.home() / ".copilot-dashboard" / "scan-cache.json"
+
+
+def _load_scan_caches() -> None:
+    """Restore _TURNS_CACHE and _PR_SCAN_CACHE from disk on startup.
+
+    Cache entries are validated lazily by mtime+size in the per-call
+    cache check, so a stale entry is harmless — at worst it triggers
+    a re-scan for that one file.
+    """
+    try:
+        with _SCAN_CACHE_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    try:
+        for sid, entry in (data.get("turns") or {}).items():
+            if (
+                isinstance(entry, list) and len(entry) == 3
+                and isinstance(entry[0], (int, float))
+                and isinstance(entry[1], int)
+                and isinstance(entry[2], str)
+            ):
+                _TURNS_CACHE[sid] = (float(entry[0]), entry[1], entry[2])
+    except Exception:
+        pass
+    try:
+        for k, v in (data.get("pr_scan") or {}).items():
+            # Stored as "path|mtime|size|mode" → {n: url}
+            parts = k.split("|", 3)
+            if len(parts) != 4:
+                continue
+            try:
+                key = (parts[0], float(parts[1]), int(parts[2]), parts[3])
+            except ValueError:
+                continue
+            if isinstance(v, dict):
+                _PR_SCAN_CACHE[key] = {int(n): str(u) for n, u in v.items()}
+    except Exception:
+        pass
+
+
+def _save_scan_caches() -> None:
+    """Persist scan caches at shutdown so the next startup is warm."""
+    try:
+        _SCAN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "turns": {sid: list(v) for sid, v in _TURNS_CACHE.items()},
+            "pr_scan": {
+                f"{k[0]}|{k[1]}|{k[2]}|{k[3]}": v
+                for k, v in _PR_SCAN_CACHE.items()
+            },
+        }
+        tmp = _SCAN_CACHE_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        tmp.replace(_SCAN_CACHE_PATH)
+    except OSError:
+        pass
 
 
 def _scan_events(events_path: Path, mtime: float) -> tuple[int, str]:
@@ -2797,7 +2856,11 @@ def main() -> int:
     if not SESSION_ROOT.exists():
         print(f"No Copilot session directory found at {SESSION_ROOT}", file=sys.stderr)
         return 1
+    _load_scan_caches()
+    import atexit
+    atexit.register(_save_scan_caches)
     DashboardApp().run()
+    _save_scan_caches()
     return 0
 
 
