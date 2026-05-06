@@ -323,26 +323,70 @@ def _count_turns(events_path: Path, mtime: float) -> int:
     return _scan_events(events_path, mtime)[0]
 
 
-def _scan_events_for_prs(events_path: Path) -> dict[int, str]:
+_PR_SCAN_CACHE: dict[tuple[str, float, int, str], dict[int, str]] = {}
+_PR_SCAN_PAT = re.compile(
+    r"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/(\d+)\b"
+)
+
+
+def _scan_events_for_prs(
+    events_path: Path,
+    *,
+    wanted: set[int] | None = None,
+    head_only_kb: int | None = 128,
+) -> dict[int, str]:
     """Scan an events.jsonl file for GitHub PR URLs.
 
-    Returns {pr_number: canonical_url}. The first URL seen for each PR
-    number wins. Used as a fallback when session-store.db hasn't yet
-    indexed a fresh session (e.g. one launched seconds ago by PR-watch).
+    Returns {pr_number: canonical_url}. Cached by (path, mtime, size, mode)
+    so repeat refreshes are cheap.
+
+    `wanted`: when set, scan the WHOLE file (line by line, early-exit
+    once every wanted number has been resolved). Use this when you know
+    which PR numbers you want from the session-store DB.
+
+    `head_only_kb`: when `wanted` is None, only the first N KB are read
+    so live sessions with multi-MB logs don't block the refresh worker.
+    PR URLs in PR-watch sessions appear in the first user message anyway.
     """
     if not events_path.exists():
         return {}
-    import re
-    pat = re.compile(
-        r"https://github\.com/([^/\s\"\\]+)/([^/\s\"\\]+)/pull/(\d+)\b"
-    )
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    mode = f"w{sorted(wanted)}" if wanted else f"h{head_only_kb}"
+    cache_key = (str(events_path), st.st_mtime, st.st_size, mode)
+    cached = _PR_SCAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     out: dict[int, str] = {}
     try:
-        with events_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+        if wanted:
+            # Full-file scan with early termination.
+            target = set(wanted)
+            with events_path.open("rb") as f:
+                for raw in f:
+                    if b"/pull/" not in raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace")
+                    for m in _PR_SCAN_PAT.finditer(line):
+                        try:
+                            pn = int(m.group(3))
+                        except ValueError:
+                            continue
+                        if pn in target and pn not in out:
+                            out[pn] = m.group(0)
+                    if target.issubset(out.keys()):
+                        break
+        else:
+            cap = (head_only_kb or 128) * 1024
+            with events_path.open("rb") as f:
+                buf = f.read(cap)
+            text = buf.decode("utf-8", errors="replace")
+            for line in text.splitlines():
                 if "/pull/" not in line:
                     continue
-                for m in pat.finditer(line):
+                for m in _PR_SCAN_PAT.finditer(line):
                     try:
                         pn = int(m.group(3))
                     except ValueError:
@@ -351,6 +395,11 @@ def _scan_events_for_prs(events_path: Path) -> dict[int, str]:
                         out[pn] = m.group(0)
     except OSError:
         pass
+    # Evict stale entries for the same (path, mode) so the cache doesn't
+    # grow unbounded as sessions are updated.
+    for k in [k for k in _PR_SCAN_CACHE if k[0] == str(events_path) and k[3] == mode]:
+        _PR_SCAN_CACHE.pop(k, None)
+    _PR_SCAN_CACHE[cache_key] = out
     return out
 
 
@@ -401,8 +450,18 @@ def _attach_store_data(sessions: list[Session]) -> None:
 
     for sid, sess in by_id.items():
         ev = SESSION_ROOT / sid / "events.jsonl"
-        ev_urls = _scan_events_for_prs(ev)  # {n: url}
-        nums = set(db_prs.get(sid) or ()) | set(ev_urls.keys())
+        db_nums = db_prs.get(sid) or set()
+        if db_nums:
+            # We know exactly which PR numbers we want — full scan with
+            # early termination guarantees correct URLs.
+            ev_urls = _scan_events_for_prs(ev, wanted=db_nums)
+            # Pick up any extra PRs mentioned in the head as a bonus.
+            head_urls = _scan_events_for_prs(ev)
+            for n, u in head_urls.items():
+                ev_urls.setdefault(n, u)
+        else:
+            ev_urls = _scan_events_for_prs(ev)
+        nums = set(db_nums) | set(ev_urls.keys())
         if not nums:
             continue
         sorted_nums = sorted(nums)
